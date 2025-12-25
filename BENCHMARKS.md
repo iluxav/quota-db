@@ -4,6 +4,35 @@ Tracking performance metrics over time. All benchmarks run in Docker containers 
 
 ---
 
+## 2025-12-26: DashMap Experiment (Reverted)
+
+### Changes Tested
+
+- Replaced manual sharding with `DashMap` concurrent hashmap
+- Simpler code but worse pipelining performance
+
+### Results (before revert)
+
+| Benchmark             | Redis             | QuotaDB           | Ratio |
+| --------------------- | ----------------- | ----------------- | ----- |
+| Single INCR           | 3,692 ops/sec     | 3,744 ops/sec     | 1.01x |
+| Pipeline (batch=100)  | 323,313 ops/sec   | 327,550 ops/sec   | 1.01x |
+| Pipeline (batch=1000) | 1,725,166 ops/sec | 1,439,902 ops/sec | 0.83x |
+
+### Decision: Reverted to Sharded Approach
+
+DashMap's fine-grained locking adds overhead at high throughput. Kept manual sharding with `Vec<RwLock<Shard>>` for better pipelining performance.
+
+### After Revert
+
+| Benchmark             | Redis             | QuotaDB           | Ratio     |
+| --------------------- | ----------------- | ----------------- | --------- |
+| Single INCR           | 3,718 ops/sec     | 3,745 ops/sec     | 1.01x     |
+| Pipeline (batch=100)  | 275,352 ops/sec   | 333,709 ops/sec   | **1.21x** |
+| Pipeline (batch=1000) | 1,549,957 ops/sec | 1,702,381 ops/sec | **1.10x** |
+
+---
+
 ## 2025-12-26: Cached Value Optimization
 
 ### Changes
@@ -107,7 +136,7 @@ cargo bench --bench redis_comparison
 
 | Metric             | Target vs Redis | Current Status |
 | ------------------ | --------------- | -------------- |
-| Single INCR        | >= 1.0x         | **1.03x**      |
-| Pipelined INCR     | >= 1.2x         | **1.19x**      |
+| Single INCR        | >= 1.0x         | **1.01x** ✓    |
+| Pipelined INCR     | >= 1.2x         | **1.21x** ✓    |
 | Concurrent INCR    | >= 1.0x         | TBD            |
 | Memory per counter | <= 0.5x         | TBD            |
