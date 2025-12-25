@@ -12,6 +12,8 @@ use crate::types::NodeId;
 ///
 /// The CRDT merge rule takes the max of each component per node,
 /// ensuring convergence across replicas.
+///
+/// Uses cached value for O(1) reads instead of O(nodes) iteration.
 #[derive(Debug, Clone)]
 pub struct PnCounterEntry {
     /// Increment counters per node
@@ -19,6 +21,9 @@ pub struct PnCounterEntry {
 
     /// Decrement counters per node
     n: FxHashMap<NodeId, u64>,
+
+    /// Cached computed value (sum(P) - sum(N)) for O(1) reads
+    cached_value: i64,
 
     /// Optional TTL: Unix timestamp in milliseconds when this entry expires
     expires_at: Option<u64>,
@@ -31,6 +36,7 @@ impl PnCounterEntry {
         Self {
             p: FxHashMap::default(),
             n: FxHashMap::default(),
+            cached_value: 0,
             expires_at: None,
         }
     }
@@ -40,6 +46,7 @@ impl PnCounterEntry {
     #[inline]
     pub fn increment(&mut self, node: NodeId, delta: u64) {
         *self.p.entry(node).or_insert(0) += delta;
+        self.cached_value += delta as i64;
     }
 
     /// Decrement by delta for the given node.
@@ -47,15 +54,14 @@ impl PnCounterEntry {
     #[inline]
     pub fn decrement(&mut self, node: NodeId, delta: u64) {
         *self.n.entry(node).or_insert(0) += delta;
+        self.cached_value -= delta as i64;
     }
 
     /// Get the current value: sum(P) - sum(N)
-    /// Returns i64 to handle negative totals.
+    /// Returns cached value for O(1) performance.
     #[inline]
     pub fn value(&self) -> i64 {
-        let sum_p: u64 = self.p.values().sum();
-        let sum_n: u64 = self.n.values().sum();
-        (sum_p as i64) - (sum_n as i64)
+        self.cached_value
     }
 
     /// Set the counter to a specific value for a given node.
@@ -71,6 +77,7 @@ impl PnCounterEntry {
         } else {
             self.n.insert(node, (-value) as u64);
         }
+        self.cached_value = value;
     }
 
     /// Merge with another PN-counter (CRDT merge rule: max per component).
@@ -91,6 +98,17 @@ impl PnCounterEntry {
                 .and_modify(|v| *v = (*v).max(count))
                 .or_insert(count);
         }
+        // Recalculate cached value after merge
+        self.recalculate_value();
+    }
+
+    /// Recalculate and cache the value from P and N maps.
+    /// Called after merge operations.
+    #[inline]
+    fn recalculate_value(&mut self) {
+        let sum_p: u64 = self.p.values().sum();
+        let sum_n: u64 = self.n.values().sum();
+        self.cached_value = (sum_p as i64) - (sum_n as i64);
     }
 
     /// Get the P component for a specific node
