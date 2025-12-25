@@ -1,0 +1,63 @@
+[package]
+name = "quota-db"
+version = "0.1.0"
+edition = "2021"
+authors = ["QuotaDB Team"]
+description = "High-performance distributed counter database with CRDT support"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full", "parking_lot"] }
+
+# RESP protocol parsing - zero-copy, battle-tested
+redis-protocol = { version = "5", features = ["resp2", "bytes", "codec"] }
+
+# Zero-copy byte buffers
+bytes = "1.9"
+
+# Fast hashing for sharding (non-cryptographic, deterministic)
+rustc-hash = "2.1"
+
+# Synchronization primitives (faster than std)
+parking_lot = "0.12"
+
+# Small vector optimization for command arrays
+smallvec = { version = "1.13", features = ["union", "const_generics"] }
+
+# Configuration parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Fast integer formatting
+itoa = "1.0"
+
+[dev-dependencies]
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+# Test utilities
+tokio-test = "0.4"
+
+# Redis client for integration tests
+redis = "0.27"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "redis_comparison"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1

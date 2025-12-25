@@ -1,0 +1,46 @@
+services:
+  quota-db:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "6380:6380"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quota-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quota-net
+
+networks:
+  quota-net:
+    driver: bridge
