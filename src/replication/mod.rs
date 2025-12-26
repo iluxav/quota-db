@@ -1,3 +1,4 @@
+mod anti_entropy;
 mod delta;
 mod digest;
 mod log;
@@ -6,6 +7,7 @@ mod peer;
 mod protocol;
 mod quota_service;
 
+pub use anti_entropy::AntiEntropyConfig;
 pub use delta::Delta;
 pub use digest::ShardDigest;
 pub use log::{ReplicationLog, ReplicationLogIter, REPLICATION_LOG_SIZE};
