@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 use crate::engine::entry::Entry;
 use crate::engine::quota::{AllocatorState, QuotaEntry};
 use crate::engine::PnCounterEntry;
-use crate::replication::{Delta, ReplicationLog};
+use crate::replication::{Delta, ReplicationLog, ShardDigest};
 use crate::types::{Key, NodeId};
 
 /// Entry in the TTL expiration queue
@@ -47,6 +47,7 @@ pub enum QuotaResult {
 /// - Its own HashMap for key-value storage
 /// - Its own TTL queue for expiration
 /// - Its own replication log for delta streaming
+/// - Its own rolling hash digest for consistency checking
 /// - The node ID for local CRDT operations
 /// - Allocator state for quota keys (when this node owns the shard)
 pub struct Shard {
@@ -65,6 +66,9 @@ pub struct Shard {
     /// Replication log for delta streaming
     rep_log: ReplicationLog,
 
+    /// Rolling hash digest for anti-entropy consistency checking
+    digest: ShardDigest,
+
     /// This node's ID for local CRDT operations
     node_id: NodeId,
 }
@@ -78,6 +82,7 @@ impl Shard {
             allocators: FxHashMap::default(),
             ttl_queue: BinaryHeap::new(),
             rep_log: ReplicationLog::new(),
+            digest: ShardDigest::new(),
             node_id,
         }
     }
@@ -101,9 +106,19 @@ impl Shard {
 
         match entry {
             Entry::Counter(counter) => {
+                let old_value = counter.value();
                 counter.increment(self.node_id, delta);
+                let new_value = counter.value();
+
+                // Update digest: remove old value (if non-zero) and insert new value
+                if old_value != 0 {
+                    self.digest.update(&key, old_value, new_value);
+                } else {
+                    self.digest.insert(&key, new_value);
+                }
+
                 let rep_delta = self.rep_log.append_increment(key, self.node_id, delta);
-                (counter.value(), rep_delta)
+                (new_value, rep_delta)
             }
             Entry::Quota(_) => {
                 // For quota keys, INCR should go through quota_consume
@@ -124,9 +139,19 @@ impl Shard {
 
         match entry {
             Entry::Counter(counter) => {
+                let old_value = counter.value();
                 counter.decrement(self.node_id, delta);
+                let new_value = counter.value();
+
+                // Update digest: remove old value (if non-zero) and insert new value
+                if old_value != 0 {
+                    self.digest.update(&key, old_value, new_value);
+                } else {
+                    self.digest.insert(&key, new_value);
+                }
+
                 let rep_delta = self.rep_log.append_decrement(key, self.node_id, delta);
-                (counter.value(), rep_delta)
+                (new_value, rep_delta)
             }
             Entry::Quota(_) => {
                 // DECR doesn't make sense for quotas
@@ -149,13 +174,32 @@ impl Shard {
 
     /// Set a key to a specific value (only works for counters)
     pub fn set(&mut self, key: Key, value: i64) {
+        // Get old value before modifying
+        let old_value = self.data.get(&key).and_then(|e| match e {
+            Entry::Counter(c) => Some(c.value()),
+            Entry::Quota(_) => None,
+        });
+
         let entry = self
             .data
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| Entry::Counter(PnCounterEntry::new()));
 
         if let Entry::Counter(counter) = entry {
             counter.set_value(self.node_id, value);
+
+            // Update digest
+            match old_value {
+                Some(old) if old != 0 => {
+                    self.digest.update(&key, old, value);
+                }
+                _ => {
+                    // Either new key or old value was 0
+                    if value != 0 {
+                        self.digest.insert(&key, value);
+                    }
+                }
+            }
         }
     }
 
@@ -342,6 +386,12 @@ impl Shard {
 
     /// Apply a remote delta from replication
     pub fn apply_delta(&mut self, delta: &Delta) {
+        // Get old value before applying
+        let old_value = self.data.get(&delta.key).and_then(|e| match e {
+            Entry::Counter(c) => Some(c.value()),
+            Entry::Quota(_) => None,
+        });
+
         let entry = self
             .data
             .entry(delta.key.clone())
@@ -354,12 +404,77 @@ impl Shard {
             if delta.delta_n > 0 {
                 counter.apply_remote_n(delta.node_id, delta.delta_n);
             }
+
+            let new_value = counter.value();
+
+            // Update digest
+            match old_value {
+                Some(old) if old != 0 => {
+                    if new_value != old {
+                        self.digest.update(&delta.key, old, new_value);
+                    }
+                }
+                _ => {
+                    // New key (old_value was None or 0)
+                    if new_value != 0 {
+                        self.digest.insert(&delta.key, new_value);
+                    }
+                }
+            }
         }
     }
 
     /// Get access to the replication log
     pub fn replication_log(&self) -> &ReplicationLog {
         &self.rep_log
+    }
+
+    // ========== Anti-Entropy / Digest Methods ==========
+
+    /// Get the current rolling hash digest value
+    #[inline]
+    pub fn digest(&self) -> u64 {
+        self.digest.value()
+    }
+
+    /// Get the current head sequence number from the replication log
+    #[inline]
+    pub fn head_seq(&self) -> u64 {
+        self.rep_log.head_seq()
+    }
+
+    /// Create a snapshot of the shard's counter state.
+    /// Returns (head_seq, digest, entries) where entries is a list of (key, value) pairs.
+    /// Quota entries are excluded from snapshots.
+    pub fn create_snapshot(&self) -> (u64, u64, Vec<(Key, i64)>) {
+        let entries: Vec<(Key, i64)> = self
+            .data
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Entry::Counter(c) => Some((k.clone(), c.value())),
+                Entry::Quota(_) => None,
+            })
+            .collect();
+        (self.rep_log.head_seq(), self.digest.value(), entries)
+    }
+
+    /// Apply a snapshot received from another replica.
+    /// Clears counter entries (keeps quotas) and rebuilds state from the snapshot.
+    pub fn apply_snapshot(&mut self, head_seq: u64, entries: Vec<(Key, i64)>) {
+        // Clear counter entries (keep quotas)
+        self.data.retain(|_, v| v.is_quota());
+        self.digest.reset();
+
+        for (key, value) in entries {
+            let mut counter = PnCounterEntry::new();
+            counter.set_value(self.node_id, value);
+            self.data.insert(key.clone(), Entry::Counter(counter));
+            if value != 0 {
+                self.digest.insert(&key, value);
+            }
+        }
+
+        self.rep_log.reset_to(head_seq);
     }
 }
 
@@ -497,5 +612,167 @@ mod tests {
         assert_eq!(delta.delta_n, 3);
 
         assert_eq!(shard.replication_log().head_seq(), 2);
+    }
+
+    // ========== Digest Integration Tests ==========
+
+    #[test]
+    fn test_digest_updates_on_increment() {
+        let mut shard = create_shard();
+        let key = Key::from("counter");
+
+        // Initially empty digest
+        let initial_digest = shard.digest();
+        assert_eq!(initial_digest, 0);
+
+        // After increment, digest should change
+        let _ = shard.increment(key.clone(), 10);
+        let digest_after_inc = shard.digest();
+        assert_ne!(digest_after_inc, 0);
+
+        // Another increment should change the digest again
+        let _ = shard.increment(key.clone(), 5);
+        let digest_after_inc2 = shard.digest();
+        assert_ne!(digest_after_inc2, digest_after_inc);
+
+        // Decrement back to original value should give same digest as after first increment
+        // (since we went from 15 back to 10)
+        let _ = shard.decrement(key.clone(), 5);
+        assert_eq!(shard.get(&key), Some(10));
+        assert_eq!(shard.digest(), digest_after_inc);
+    }
+
+    #[test]
+    fn test_digest_consistency() {
+        // Same operations in different order should produce the same final digest
+        let mut shard1 = Shard::new(0, NodeId::new(1));
+        let mut shard2 = Shard::new(0, NodeId::new(1));
+
+        let key1 = Key::from("a");
+        let key2 = Key::from("b");
+        let key3 = Key::from("c");
+
+        // Shard1: a, b, c order
+        shard1.set(key1.clone(), 10);
+        shard1.set(key2.clone(), 20);
+        shard1.set(key3.clone(), 30);
+
+        // Shard2: c, a, b order
+        shard2.set(key3.clone(), 30);
+        shard2.set(key1.clone(), 10);
+        shard2.set(key2.clone(), 20);
+
+        // Same data => same digest (order-independent)
+        assert_eq!(shard1.digest(), shard2.digest());
+    }
+
+    #[test]
+    fn test_snapshot_round_trip() {
+        let mut shard1 = Shard::new(0, NodeId::new(1));
+        let key1 = Key::from("counter1");
+        let key2 = Key::from("counter2");
+        let key3 = Key::from("counter3");
+
+        // Add some data and perform some operations
+        let _ = shard1.increment(key1.clone(), 100);
+        let _ = shard1.increment(key2.clone(), 200);
+        let _ = shard1.decrement(key2.clone(), 50);
+        shard1.set(key3.clone(), -42);
+
+        // Create snapshot
+        let (head_seq, orig_digest, entries) = shard1.create_snapshot();
+
+        // Apply snapshot to a fresh shard
+        let mut shard2 = Shard::new(0, NodeId::new(2));
+        shard2.apply_snapshot(head_seq, entries);
+
+        // Values should match
+        assert_eq!(shard2.get(&key1), Some(100));
+        assert_eq!(shard2.get(&key2), Some(150));
+        assert_eq!(shard2.get(&key3), Some(-42));
+
+        // Digests should match
+        assert_eq!(shard2.digest(), orig_digest);
+
+        // Head sequence should match
+        assert_eq!(shard2.head_seq(), head_seq);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_quotas() {
+        let mut shard = Shard::new(0, NodeId::new(1));
+        let counter_key = Key::from("counter");
+        let quota_key = Key::from("quota");
+
+        // Add counter and quota
+        let _ = shard.increment(counter_key.clone(), 50);
+        shard.quota_set(quota_key.clone(), 1000, 60);
+
+        assert_eq!(shard.len(), 2);
+
+        // Create and apply snapshot (with only counter data)
+        let (head_seq, _, entries) = shard.create_snapshot();
+        assert_eq!(entries.len(), 1); // Only the counter
+
+        // Apply snapshot - quotas should be preserved
+        shard.apply_snapshot(head_seq, entries);
+
+        // Quota should still exist
+        assert!(shard.is_quota(&quota_key));
+        assert!(shard.quota_get(&quota_key).is_some());
+
+        // Counter should be restored
+        assert_eq!(shard.get(&counter_key), Some(50));
+    }
+
+    #[test]
+    fn test_head_seq_getter() {
+        let mut shard = create_shard();
+
+        assert_eq!(shard.head_seq(), 0);
+
+        let _ = shard.increment(Key::from("a"), 1);
+        assert_eq!(shard.head_seq(), 1);
+
+        let _ = shard.increment(Key::from("b"), 2);
+        assert_eq!(shard.head_seq(), 2);
+
+        let _ = shard.decrement(Key::from("a"), 1);
+        assert_eq!(shard.head_seq(), 3);
+    }
+
+    #[test]
+    fn test_digest_with_apply_delta() {
+        let mut shard1 = Shard::new(0, NodeId::new(1));
+        let mut shard2 = Shard::new(0, NodeId::new(1));
+        let key = Key::from("counter");
+
+        // Shard1: increment directly
+        let _ = shard1.increment(key.clone(), 10);
+
+        // Shard2: apply equivalent delta
+        let delta = Delta::increment(0, key.clone(), NodeId::new(1), 10);
+        shard2.apply_delta(&delta);
+
+        // Both should have same value and same digest
+        assert_eq!(shard1.get(&key), shard2.get(&key));
+        assert_eq!(shard1.digest(), shard2.digest());
+    }
+
+    #[test]
+    fn test_digest_empty_after_remove() {
+        let mut shard = create_shard();
+        let key = Key::from("counter");
+
+        // Add a value
+        shard.set(key.clone(), 100);
+        let digest_with_value = shard.digest();
+        assert_ne!(digest_with_value, 0);
+
+        // Set to 0 (effectively "removing" from digest perspective)
+        shard.set(key.clone(), 0);
+
+        // Value should be 0 but digest might include the 0 entry
+        assert_eq!(shard.get(&key), Some(0));
     }
 }

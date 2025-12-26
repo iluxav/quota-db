@@ -114,6 +114,16 @@ impl ReplicationLog {
             self.head_seq - acked_seq
         }
     }
+
+    /// Reset the log to a specific sequence number.
+    /// Clears all buffer entries and sets head_seq to the given value.
+    /// Used during snapshot restore.
+    pub fn reset_to(&mut self, seq: u64) {
+        self.head_seq = seq;
+        for slot in self.buffer.iter_mut() {
+            *slot = None;
+        }
+    }
 }
 
 impl Default for ReplicationLog {
@@ -232,5 +242,50 @@ mod tests {
         assert_eq!(log.pending_count(50), 50);
         assert_eq!(log.pending_count(100), 0);
         assert_eq!(log.pending_count(150), 0); // Ahead of head
+    }
+
+    #[test]
+    fn test_reset_to() {
+        let mut log = ReplicationLog::new();
+        let node = NodeId::new(1);
+
+        // Add some entries
+        for i in 0..10 {
+            log.append_increment(Key::from(format!("key{}", i)), node, i as u64);
+        }
+
+        assert_eq!(log.head_seq(), 10);
+        assert!(log.get(5).is_some());
+
+        // Reset to sequence 1000
+        log.reset_to(1000);
+
+        // head_seq should be updated
+        assert_eq!(log.head_seq(), 1000);
+
+        // Buffer should be cleared (old entries not available)
+        assert!(log.get(5).is_none());
+        assert!(log.get(999).is_none());
+
+        // tail_seq should reflect new state
+        assert_eq!(log.tail_seq(), 0); // Still within buffer size
+    }
+
+    #[test]
+    fn test_reset_to_zero() {
+        let mut log = ReplicationLog::new();
+        let node = NodeId::new(1);
+
+        for _ in 0..50 {
+            log.append_increment(Key::from("key"), node, 1);
+        }
+
+        assert_eq!(log.head_seq(), 50);
+
+        log.reset_to(0);
+
+        assert_eq!(log.head_seq(), 0);
+        assert_eq!(log.tail_seq(), 0);
+        assert!(log.get(0).is_none());
     }
 }
