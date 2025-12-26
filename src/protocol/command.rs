@@ -30,6 +30,18 @@ pub enum Command {
 
     /// SET key value (for compatibility - sets counter to value)
     Set(Key, i64),
+
+    /// CONFIG GET param - returns param name and empty value for compatibility
+    ConfigGet(Bytes),
+
+    /// CONFIG SET - no-op for compatibility
+    ConfigSet,
+
+    /// DBSIZE - return 0 for compatibility
+    DbSize,
+
+    /// FLUSHDB/FLUSHALL - stub for compatibility
+    Flush,
 }
 
 impl Command {
@@ -95,6 +107,25 @@ impl Command {
                 let value = Self::extract_i64(&array, 2)?;
                 Ok(Command::Set(key, value))
             }
+            b"CONFIG" => {
+                // CONFIG GET param or CONFIG SET param value
+                if array.len() >= 3 {
+                    let subcommand = Self::extract_bytes(&array, 1)?;
+                    let sub_upper: Vec<u8> = subcommand.iter().map(|b| b.to_ascii_uppercase()).collect();
+                    match sub_upper.as_slice() {
+                        b"GET" => {
+                            let param = Self::extract_bytes(&array, 2)?;
+                            Ok(Command::ConfigGet(param))
+                        }
+                        b"SET" => Ok(Command::ConfigSet),
+                        _ => Ok(Command::ConfigSet), // Treat unknown subcommands as no-op
+                    }
+                } else {
+                    Ok(Command::ConfigSet) // No-op for malformed CONFIG
+                }
+            }
+            b"DBSIZE" => Ok(Command::DbSize),
+            b"FLUSHDB" | b"FLUSHALL" => Ok(Command::Flush),
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd_name);
                 Err(Error::UnknownCommand(cmd_str.to_string()))
@@ -151,6 +182,10 @@ impl Command {
             Command::Decr(_) => "DECR",
             Command::DecrBy(_, _) => "DECRBY",
             Command::Set(_, _) => "SET",
+            Command::ConfigGet(_) => "CONFIG GET",
+            Command::ConfigSet => "CONFIG SET",
+            Command::DbSize => "DBSIZE",
+            Command::Flush => "FLUSH",
         }
     }
 }

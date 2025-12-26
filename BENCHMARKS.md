@@ -4,6 +4,44 @@ Tracking performance metrics over time. All benchmarks run in Docker containers 
 
 ---
 
+## 2025-12-26: Parser Fix + redis-benchmark Compatibility
+
+### Changes
+
+- Fixed critical buffer corruption bug in RESP array parser
+- Added inline command parsing for redis-benchmark compatibility
+- Added CONFIG GET/SET, DBSIZE, FLUSHDB stub commands
+
+### Bug Fix Details
+
+The array parser was advancing the buffer **before** parsing elements. When partial reads occurred, this corrupted the buffer state. Fixed with two-phase parsing:
+
+1. Check if complete array is present (without consuming bytes)
+2. Only then advance buffer and parse elements
+
+### redis-benchmark Results (50 concurrent connections)
+
+| Benchmark | Redis              | QuotaDB            | Ratio     | Notes                   |
+| --------- | ------------------ | ------------------ | --------- | ----------------------- |
+| PING      | 44,208 ops/sec     | 41,322 ops/sec     | 0.93x     | Baseline latency test   |
+| **INCR**  | **41,000 ops/sec** | **42,662 ops/sec** | **1.04x** | Core use case - faster! |
+| GET       | 43,860 ops/sec     | 39,557 ops/sec     | 0.90x     | Read performance        |
+
+### Pipelined Results (P=16, 50 connections)
+
+| Benchmark | Redis           | QuotaDB         | Ratio |
+| --------- | --------------- | --------------- | ----- |
+| INCR      | 598,802 ops/sec | 478,469 ops/sec | 0.80x |
+
+### Key Findings
+
+- **QuotaDB outperforms Redis by 4% on INCR** (the primary use case)
+- PING/GET are ~90-93% of Redis (acceptable overhead for CRDT structure)
+- Pipelined performance at 80% of Redis (optimization opportunity)
+- 100K request benchmarks now complete without errors
+
+---
+
 ## 2025-12-26: DashMap Experiment (Reverted)
 
 ### Changes Tested
@@ -134,9 +172,13 @@ cargo bench --bench redis_comparison
 
 ## Performance Targets
 
-| Metric             | Target vs Redis | Current Status |
-| ------------------ | --------------- | -------------- |
-| Single INCR        | >= 1.0x         | **1.01x** ✓    |
-| Pipelined INCR     | >= 1.2x         | **1.21x** ✓    |
-| Concurrent INCR    | >= 1.0x         | TBD            |
-| Memory per counter | <= 0.5x         | TBD            |
+| Metric             | Target vs Redis | Current Status | Source                  |
+| ------------------ | --------------- | -------------- | ----------------------- |
+| Single INCR        | >= 1.0x         | **1.04x** ✓    | redis-benchmark         |
+| Pipelined INCR     | >= 1.2x         | 0.80x          | redis-benchmark P=16    |
+| Concurrent INCR    | >= 1.0x         | **1.04x** ✓    | redis-benchmark 50 conn |
+| Memory per counter | <= 0.5x         | TBD            | -                       |
+
+**Notes:**
+
+- Pipelined performance (0.80x) is below target. The two-phase parsing adds overhead for partial reads. Future optimization: batch validation to reduce double-scanning.

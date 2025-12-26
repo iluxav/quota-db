@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quota_db::config::Config;
 use quota_db::engine::ShardedDb;
+use quota_db::replication::{ReplicationConfig, ReplicationManager};
 use quota_db::server::Listener;
 
 use tracing::{info, Level};
@@ -58,8 +59,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Set up replication if peers are configured
+    let replication_handle = if !config.peers.is_empty() {
+        // Filter out empty peer strings
+        let peers: Vec<String> = config
+            .peers
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+
+        if !peers.is_empty() {
+            info!("Replication enabled with {} peers: {:?}", peers.len(), peers);
+
+            // Resolve peer hostnames to addresses
+            let mut peer_addrs = Vec::new();
+            for peer in &peers {
+                match tokio::net::lookup_host(peer).await {
+                    Ok(mut addrs) => {
+                        if let Some(addr) = addrs.next() {
+                            info!("Resolved peer {} -> {}", peer, addr);
+                            peer_addrs.push(addr);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to resolve peer {}: {}", peer, e);
+                    }
+                }
+            }
+
+            let rep_config = ReplicationConfig {
+                node_id: config.node_id(),
+                listen_port: config.replication_port,
+                peers: peer_addrs,
+                num_shards: config.shards,
+                batch_max_size: config.batch_max_size,
+                batch_max_delay: Duration::from_millis(config.batch_max_delay_ms),
+            };
+
+            let (manager, handle) = ReplicationManager::new(rep_config);
+
+            // Create apply_delta callback
+            let db_clone = db.clone();
+            let apply_delta = Arc::new(move |shard_id: u16, delta: quota_db::replication::Delta| {
+                db_clone.apply_delta(shard_id, &delta);
+            });
+
+            // Start replication manager
+            tokio::spawn(async move {
+                manager.run(apply_delta).await;
+            });
+
+            Some(handle)
+        } else {
+            None
+        }
+    } else {
+        info!("Replication disabled (no peers configured)");
+        None
+    };
+
     // Create and run the listener
     let listener = Listener::bind(&config, db).await?;
+    let listener = if let Some(handle) = replication_handle {
+        listener.with_replication(handle)
+    } else {
+        listener
+    };
 
     info!("Ready to accept connections");
     listener.run().await?;

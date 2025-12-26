@@ -2,6 +2,7 @@ use parking_lot::RwLock;
 
 use crate::config::Config;
 use crate::engine::Shard;
+use crate::replication::Delta;
 use crate::types::{Key, NodeId};
 
 /// Thread-safe sharded database.
@@ -52,18 +53,27 @@ impl ShardedDb {
         (key.shard_hash() as usize) % self.num_shards
     }
 
-    /// Increment a key by delta, returning the new value.
+    /// Increment a key by delta, returning (shard_id, new_value, replication_delta).
     #[inline]
-    pub fn increment(&self, key: Key, delta: u64) -> i64 {
+    pub fn increment(&self, key: Key, delta: u64) -> (u16, i64, Delta) {
         let idx = self.shard_index(&key);
-        self.shards[idx].write().increment(key, delta)
+        let (value, rep_delta) = self.shards[idx].write().increment(key, delta);
+        (idx as u16, value, rep_delta)
     }
 
-    /// Decrement a key by delta, returning the new value.
+    /// Decrement a key by delta, returning (shard_id, new_value, replication_delta).
     #[inline]
-    pub fn decrement(&self, key: Key, delta: u64) -> i64 {
+    pub fn decrement(&self, key: Key, delta: u64) -> (u16, i64, Delta) {
         let idx = self.shard_index(&key);
-        self.shards[idx].write().decrement(key, delta)
+        let (value, rep_delta) = self.shards[idx].write().decrement(key, delta);
+        (idx as u16, value, rep_delta)
+    }
+
+    /// Apply a remote delta from replication.
+    pub fn apply_delta(&self, shard_id: u16, delta: &Delta) {
+        if (shard_id as usize) < self.num_shards {
+            self.shards[shard_id as usize].write().apply_delta(delta);
+        }
     }
 
     /// Get the value of a key.
@@ -124,7 +134,8 @@ mod tests {
         let key = Key::from("counter");
 
         assert_eq!(db.get(&key), None);
-        assert_eq!(db.increment(key.clone(), 5), 5);
+        let (_, val, _) = db.increment(key.clone(), 5);
+        assert_eq!(val, 5);
         assert_eq!(db.get(&key), Some(5));
     }
 
@@ -133,8 +144,9 @@ mod tests {
         let db = create_db();
         let key = Key::from("counter");
 
-        db.increment(key.clone(), 10);
-        assert_eq!(db.decrement(key.clone(), 3), 7);
+        let _ = db.increment(key.clone(), 10);
+        let (_, val, _) = db.decrement(key.clone(), 3);
+        assert_eq!(val, 7);
     }
 
     #[test]
@@ -152,7 +164,7 @@ mod tests {
 
         for i in 0..100 {
             let key = Key::from(format!("key{}", i));
-            db.increment(key, 1);
+            let _ = db.increment(key, 1);
         }
 
         assert_eq!(db.total_entries(), 100);
@@ -164,8 +176,9 @@ mod tests {
         let key = Key::from("test_key");
 
         // Increment and decrement should go to the same shard
-        db.increment(key.clone(), 10);
-        assert_eq!(db.decrement(key.clone(), 3), 7);
+        let _ = db.increment(key.clone(), 10);
+        let (_, val, _) = db.decrement(key.clone(), 3);
+        assert_eq!(val, 7);
         assert_eq!(db.get(&key), Some(7));
     }
 
@@ -175,7 +188,7 @@ mod tests {
 
         for i in 0..10 {
             let key = Key::from(format!("key{}", i));
-            db.increment(key.clone(), 1);
+            let _ = db.increment(key.clone(), 1);
             db.expire(key, 1000);
         }
 
@@ -193,7 +206,7 @@ mod tests {
         // Add enough keys to spread across shards
         for i in 0..1000 {
             let key = Key::from(format!("key_{}", i));
-            db.increment(key, 1);
+            let _ = db.increment(key, 1);
         }
 
         let sizes = db.shard_sizes();
@@ -222,7 +235,7 @@ mod tests {
             let key_clone = key.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
-                    db_clone.increment(key_clone.clone(), 1);
+                    let _ = db_clone.increment(key_clone.clone(), 1);
                 }
             }));
         }
@@ -232,5 +245,20 @@ mod tests {
         }
 
         assert_eq!(db.get(&key), Some(1000));
+    }
+
+    #[test]
+    fn test_apply_delta() {
+        let db = create_db();
+        let key = Key::from("counter");
+
+        // Get the shard index for this key
+        let shard_idx = (key.shard_hash() as usize) % db.num_shards();
+
+        // Apply a remote delta to the correct shard
+        let delta = Delta::increment(0, key.clone(), crate::types::NodeId::new(2), 10);
+        db.apply_delta(shard_idx as u16, &delta);
+
+        assert_eq!(db.get(&key), Some(10));
     }
 }

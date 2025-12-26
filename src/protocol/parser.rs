@@ -27,8 +27,36 @@ impl Parser {
             b':' => self.parse_integer(buf),
             b'$' => self.parse_bulk_string(buf),
             b'*' => self.parse_array(buf),
-            _ => Err(Error::Protocol(format!("unknown type byte: {}", first_byte))),
+            // Inline commands: PING\r\n, INCR key\r\n, etc.
+            _ => self.parse_inline(buf),
         }
+    }
+
+    /// Parse an inline command: PING\r\n or GET key\r\n
+    /// Converts to an array frame for uniform handling
+    fn parse_inline(&self, buf: &mut BytesMut) -> Result<Frame> {
+        let crlf_pos = self.find_crlf(buf).ok_or(Error::Incomplete)?;
+        let line = &buf[..crlf_pos];
+
+        // Split by whitespace
+        let parts: Vec<&[u8]> = line
+            .split(|&b| b == b' ' || b == b'\t')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if parts.is_empty() {
+            buf.advance(crlf_pos + 2);
+            return Err(Error::Protocol("empty inline command".to_string()));
+        }
+
+        // Convert to array of bulk strings
+        let frames: Vec<Frame> = parts
+            .into_iter()
+            .map(|p| Frame::Bulk(Bytes::copy_from_slice(p)))
+            .collect();
+
+        buf.advance(crlf_pos + 2);
+        Ok(Frame::Array(frames))
     }
 
     /// Find the position of \r\n in the buffer
@@ -102,6 +130,9 @@ impl Parser {
     }
 
     /// Parse an array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+    ///
+    /// IMPORTANT: We must check the entire array is complete before consuming
+    /// any bytes. Otherwise, partial reads corrupt the buffer state.
     fn parse_array(&self, buf: &mut BytesMut) -> Result<Frame> {
         let crlf_pos = self.find_crlf(buf).ok_or(Error::Incomplete)?;
         let len_str = std::str::from_utf8(&buf[1..crlf_pos])
@@ -116,13 +147,106 @@ impl Parser {
         }
 
         let len = len as usize;
-        buf.advance(crlf_pos + 2);
+        let header_len = crlf_pos + 2;
 
+        // First pass: check if entire array is present without consuming
+        let total_len = self.check_array_complete(buf, header_len, len)?;
+
+        // All elements present - now parse and consume
+        buf.advance(header_len);
         let mut frames = Vec::with_capacity(len);
         for _ in 0..len {
             frames.push(self.parse(buf)?);
         }
+
+        // Sanity check: we should have consumed exactly what we calculated
+        debug_assert!(total_len >= header_len);
+
         Ok(Frame::Array(frames))
+    }
+
+    /// Check if a complete array is present in the buffer starting at offset.
+    /// Returns total byte length of the array (including header) if complete.
+    fn check_array_complete(&self, buf: &[u8], offset: usize, count: usize) -> Result<usize> {
+        let mut pos = offset;
+
+        for _ in 0..count {
+            if pos >= buf.len() {
+                return Err(Error::Incomplete);
+            }
+
+            let elem_len = self.check_frame_complete(&buf[pos..])?;
+            pos += elem_len;
+        }
+
+        Ok(pos)
+    }
+
+    /// Check if a complete frame is present, return its byte length if so.
+    fn check_frame_complete(&self, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Err(Error::Incomplete);
+        }
+
+        match buf[0] {
+            b'+' | b'-' | b':' => {
+                // Simple string, error, or integer: find \r\n
+                self.find_crlf_in(buf)
+                    .map(|pos| pos + 2)
+                    .ok_or(Error::Incomplete)
+            }
+            b'$' => {
+                // Bulk string: $len\r\n<content>\r\n
+                let crlf_pos = self.find_crlf_in(buf).ok_or(Error::Incomplete)?;
+                let len_str = std::str::from_utf8(&buf[1..crlf_pos])
+                    .map_err(|e| Error::Protocol(format!("invalid utf8: {}", e)))?;
+                let len: i64 = len_str
+                    .parse()
+                    .map_err(|_| Error::Protocol(format!("invalid length: {}", len_str)))?;
+
+                if len == -1 {
+                    Ok(crlf_pos + 2)
+                } else {
+                    let total = crlf_pos + 2 + (len as usize) + 2;
+                    if buf.len() >= total {
+                        Ok(total)
+                    } else {
+                        Err(Error::Incomplete)
+                    }
+                }
+            }
+            b'*' => {
+                // Nested array
+                let crlf_pos = self.find_crlf_in(buf).ok_or(Error::Incomplete)?;
+                let len_str = std::str::from_utf8(&buf[1..crlf_pos])
+                    .map_err(|e| Error::Protocol(format!("invalid utf8: {}", e)))?;
+                let len: i64 = len_str
+                    .parse()
+                    .map_err(|_| Error::Protocol(format!("invalid length: {}", len_str)))?;
+
+                if len == -1 {
+                    Ok(crlf_pos + 2)
+                } else {
+                    self.check_array_complete(buf, crlf_pos + 2, len as usize)
+                }
+            }
+            _ => {
+                // Inline command
+                self.find_crlf_in(buf)
+                    .map(|pos| pos + 2)
+                    .ok_or(Error::Incomplete)
+            }
+        }
+    }
+
+    /// Find \r\n in a slice (non-mutating version)
+    fn find_crlf_in(&self, buf: &[u8]) -> Option<usize> {
+        for i in 0..buf.len().saturating_sub(1) {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+                return Some(i);
+            }
+        }
+        None
     }
 }
 

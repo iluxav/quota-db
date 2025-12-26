@@ -33,6 +33,24 @@ pub struct Config {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    // === Replication settings ===
+
+    /// Peer nodes for replication (comma-separated, e.g., "node2:6381,node3:6381")
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub peers: Vec<String>,
+
+    /// Port for replication connections (separate from client port)
+    #[arg(long, default_value = "6381")]
+    pub replication_port: u16,
+
+    /// Maximum deltas per batch before flushing to peers
+    #[arg(long, default_value = "100")]
+    pub batch_max_size: usize,
+
+    /// Maximum delay in milliseconds before flushing batch to peers
+    #[arg(long, default_value = "10")]
+    pub batch_max_delay_ms: u64,
 }
 
 impl Config {
@@ -57,6 +75,10 @@ impl Default for Config {
             enable_ttl: true,
             ttl_tick_ms: 100,
             log_level: "info".to_string(),
+            peers: Vec::new(),
+            replication_port: 6381,
+            batch_max_size: 100,
+            batch_max_delay_ms: 10,
         }
     }
 }

@@ -1,0 +1,70 @@
+# Multi-node QuotaDB cluster for replication testing
+# Usage: docker compose -f docker-compose.cluster.yml up -d --build
+
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "1", "--replication-port", "6381", "--peers", "node2:6381,node3:6381"]
+    ports:
+      - "6380:6380"   # Client port
+      - "6381:6381"   # Replication port
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quota-cluster
+
+  node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "2", "--replication-port", "6381", "--peers", "node1:6381,node3:6381"]
+    ports:
+      - "6382:6380"   # Client port (mapped to 6382 on host)
+      - "6383:6381"   # Replication port
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quota-cluster
+
+  node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "3", "--replication-port", "6381", "--peers", "node1:6381,node2:6381"]
+    ports:
+      - "6384:6380"   # Client port (mapped to 6384 on host)
+      - "6385:6381"   # Replication port
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - quota-cluster
+
+networks:
+  quota-cluster:
+    driver: bridge

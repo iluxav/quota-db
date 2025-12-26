@@ -147,6 +147,24 @@ impl PnCounterEntry {
         nodes.extend(self.n.keys());
         nodes.len()
     }
+
+    /// Apply a remote increment delta.
+    /// Used for replication: adds delta to the specified node's P counter.
+    /// Unlike local increment, this is additive to handle out-of-order deltas.
+    #[inline]
+    pub fn apply_remote_p(&mut self, node: NodeId, delta: u64) {
+        *self.p.entry(node).or_insert(0) += delta;
+        self.cached_value += delta as i64;
+    }
+
+    /// Apply a remote decrement delta.
+    /// Used for replication: adds delta to the specified node's N counter.
+    /// Unlike local decrement, this is additive to handle out-of-order deltas.
+    #[inline]
+    pub fn apply_remote_n(&mut self, node: NodeId, delta: u64) {
+        *self.n.entry(node).or_insert(0) += delta;
+        self.cached_value -= delta as i64;
+    }
 }
 
 impl Default for PnCounterEntry {

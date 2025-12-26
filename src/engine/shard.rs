@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::engine::PnCounterEntry;
+use crate::replication::{Delta, ReplicationLog};
 use crate::types::{Key, NodeId};
 
 /// Entry in the TTL expiration queue
@@ -30,6 +31,7 @@ impl PartialOrd for TtlEntry {
 /// Each shard has:
 /// - Its own HashMap for key-value storage
 /// - Its own TTL queue for expiration
+/// - Its own replication log for delta streaming
 /// - The node ID for local CRDT operations
 pub struct Shard {
     /// Shard ID for debugging/metrics
@@ -40,6 +42,9 @@ pub struct Shard {
 
     /// TTL expiration queue (min-heap by expiration time)
     ttl_queue: BinaryHeap<TtlEntry>,
+
+    /// Replication log for delta streaming
+    rep_log: ReplicationLog,
 
     /// This node's ID for local CRDT operations
     node_id: NodeId,
@@ -52,6 +57,7 @@ impl Shard {
             id,
             data: FxHashMap::default(),
             ttl_queue: BinaryHeap::new(),
+            rep_log: ReplicationLog::new(),
             node_id,
         }
     }
@@ -62,20 +68,22 @@ impl Shard {
         self.id
     }
 
-    /// Increment a key by delta, returning the new value
+    /// Increment a key by delta, returning the new value and replication delta
     #[inline]
-    pub fn increment(&mut self, key: Key, delta: u64) -> i64 {
-        let entry = self.data.entry(key).or_default();
+    pub fn increment(&mut self, key: Key, delta: u64) -> (i64, Delta) {
+        let entry = self.data.entry(key.clone()).or_default();
         entry.increment(self.node_id, delta);
-        entry.value()
+        let rep_delta = self.rep_log.append_increment(key, self.node_id, delta);
+        (entry.value(), rep_delta)
     }
 
-    /// Decrement a key by delta, returning the new value
+    /// Decrement a key by delta, returning the new value and replication delta
     #[inline]
-    pub fn decrement(&mut self, key: Key, delta: u64) -> i64 {
-        let entry = self.data.entry(key).or_default();
+    pub fn decrement(&mut self, key: Key, delta: u64) -> (i64, Delta) {
+        let entry = self.data.entry(key.clone()).or_default();
         entry.decrement(self.node_id, delta);
-        entry.value()
+        let rep_delta = self.rep_log.append_decrement(key, self.node_id, delta);
+        (entry.value(), rep_delta)
     }
 
     /// Get the current value of a key
@@ -147,6 +155,22 @@ impl Shard {
             .and_modify(|e| e.merge(other))
             .or_insert_with(|| other.clone());
     }
+
+    /// Apply a remote delta from replication
+    pub fn apply_delta(&mut self, delta: &Delta) {
+        let entry = self.data.entry(delta.key.clone()).or_default();
+        if delta.delta_p > 0 {
+            entry.apply_remote_p(delta.node_id, delta.delta_p);
+        }
+        if delta.delta_n > 0 {
+            entry.apply_remote_n(delta.node_id, delta.delta_n);
+        }
+    }
+
+    /// Get access to the replication log
+    pub fn replication_log(&self) -> &ReplicationLog {
+        &self.rep_log
+    }
 }
 
 #[cfg(test)]
@@ -163,9 +187,11 @@ mod tests {
         let key = Key::from("counter");
 
         assert_eq!(shard.get(&key), None);
-        assert_eq!(shard.increment(key.clone(), 5), 5);
+        let (val, _delta) = shard.increment(key.clone(), 5);
+        assert_eq!(val, 5);
         assert_eq!(shard.get(&key), Some(5));
-        assert_eq!(shard.increment(key.clone(), 3), 8);
+        let (val, _delta) = shard.increment(key.clone(), 3);
+        assert_eq!(val, 8);
         assert_eq!(shard.get(&key), Some(8));
     }
 
@@ -175,7 +201,8 @@ mod tests {
         let key = Key::from("counter");
 
         shard.increment(key.clone(), 10);
-        assert_eq!(shard.decrement(key.clone(), 3), 7);
+        let (val, _delta) = shard.decrement(key.clone(), 3);
+        assert_eq!(val, 7);
         assert_eq!(shard.get(&key), Some(7));
     }
 
@@ -184,7 +211,8 @@ mod tests {
         let mut shard = create_shard();
         let key = Key::from("counter");
 
-        assert_eq!(shard.decrement(key.clone(), 5), -5);
+        let (val, _delta) = shard.decrement(key.clone(), 5);
+        assert_eq!(val, -5);
         assert_eq!(shard.get(&key), Some(-5));
     }
 
@@ -205,7 +233,7 @@ mod tests {
         let mut shard = create_shard();
         let key = Key::from("counter");
 
-        shard.increment(key.clone(), 10);
+        let _ = shard.increment(key.clone(), 10);
         shard.expire(key.clone(), 1000);
 
         assert_eq!(shard.expire_entries(500), 0);
@@ -221,10 +249,10 @@ mod tests {
         assert_eq!(shard.len(), 0);
         assert!(shard.is_empty());
 
-        shard.increment(Key::from("a"), 1);
+        let _ = shard.increment(Key::from("a"), 1);
         assert_eq!(shard.len(), 1);
 
-        shard.increment(Key::from("b"), 1);
+        let _ = shard.increment(Key::from("b"), 1);
         assert_eq!(shard.len(), 2);
 
         assert!(!shard.is_empty());
@@ -236,8 +264,8 @@ mod tests {
         let mut shard2 = Shard::new(0, NodeId::new(2));
         let key = Key::from("counter");
 
-        shard1.increment(key.clone(), 10);
-        shard2.increment(key.clone(), 5);
+        let _ = shard1.increment(key.clone(), 10);
+        let _ = shard2.increment(key.clone(), 5);
 
         // Merge shard2's entry into shard1
         let entry2 = shard2.get_entry(&key).unwrap().clone();
@@ -245,5 +273,39 @@ mod tests {
 
         // Value should be sum of both: 10 + 5 = 15
         assert_eq!(shard1.get(&key), Some(15));
+    }
+
+    #[test]
+    fn test_apply_delta() {
+        let mut shard = create_shard();
+        let key = Key::from("counter");
+
+        // Apply a remote increment delta
+        let delta = Delta::increment(0, key.clone(), NodeId::new(2), 10);
+        shard.apply_delta(&delta);
+
+        assert_eq!(shard.get(&key), Some(10));
+
+        // Apply a remote decrement delta
+        let delta = Delta::decrement(1, key.clone(), NodeId::new(2), 3);
+        shard.apply_delta(&delta);
+
+        assert_eq!(shard.get(&key), Some(7));
+    }
+
+    #[test]
+    fn test_replication_log() {
+        let mut shard = create_shard();
+        let key = Key::from("counter");
+
+        let (_, delta) = shard.increment(key.clone(), 10);
+        assert_eq!(delta.seq, 0);
+        assert_eq!(delta.delta_p, 10);
+
+        let (_, delta) = shard.decrement(key.clone(), 3);
+        assert_eq!(delta.seq, 1);
+        assert_eq!(delta.delta_n, 3);
+
+        assert_eq!(shard.replication_log().head_seq(), 2);
     }
 }

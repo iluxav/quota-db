@@ -5,6 +5,7 @@ use tracing::{error, info};
 
 use crate::config::Config;
 use crate::engine::ShardedDb;
+use crate::replication::ReplicationHandle;
 use crate::server::{Connection, Handler};
 
 /// TCP listener that accepts connections and spawns handlers.
@@ -12,6 +13,7 @@ pub struct Listener {
     listener: TcpListener,
     db: Arc<ShardedDb>,
     connection_limit: Arc<Semaphore>,
+    replication: Option<ReplicationHandle>,
 }
 
 impl Listener {
@@ -24,7 +26,14 @@ impl Listener {
             listener,
             db,
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
+            replication: None,
         })
+    }
+
+    /// Set the replication handle for outgoing replication.
+    pub fn with_replication(mut self, handle: ReplicationHandle) -> Self {
+        self.replication = Some(handle);
+        self
     }
 
     /// Run the accept loop, spawning a handler for each connection.
@@ -46,10 +55,15 @@ impl Listener {
             }
 
             let db = self.db.clone();
+            let replication = self.replication.clone();
 
             tokio::spawn(async move {
                 let connection = Connection::new(socket);
-                let mut handler = Handler::new(connection, db);
+                let mut handler = if let Some(rep) = replication {
+                    Handler::with_replication(connection, db, rep)
+                } else {
+                    Handler::new(connection, db)
+                };
 
                 if let Err(e) = handler.run().await {
                     error!("Connection error from {}: {}", addr, e);
