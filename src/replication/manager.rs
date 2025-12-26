@@ -1,3 +1,4 @@
+use crate::engine::ShardedDb;
 use crate::replication::{Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerState};
 use crate::types::NodeId;
 use std::collections::HashMap;
@@ -68,6 +69,10 @@ pub struct ReplicationManager {
     outbound_peers: HashMap<SocketAddr, PeerState>,
     /// Active writers for sending to peers
     writers: HashMap<SocketAddr, PeerConnectionWriter>,
+    /// Database reference for quota operations (optional)
+    db: Option<Arc<ShardedDb>>,
+    /// Number of nodes in cluster for allocator assignment
+    num_nodes: usize,
 }
 
 impl ReplicationManager {
@@ -75,6 +80,7 @@ impl ReplicationManager {
     pub fn new(config: ReplicationConfig) -> (Self, ReplicationHandle) {
         let (tx, rx) = mpsc::unbounded_channel();
 
+        let num_nodes = config.peers.len() + 1; // peers + self
         let mut outbound_peers = HashMap::new();
         for addr in &config.peers {
             outbound_peers.insert(*addr, PeerState::new(*addr, config.num_shards));
@@ -85,10 +91,27 @@ impl ReplicationManager {
             delta_rx: rx,
             outbound_peers,
             writers: HashMap::new(),
+            db: None,
+            num_nodes,
         };
 
         let handle = ReplicationHandle { tx };
         (manager, handle)
+    }
+
+    /// Set the database reference for quota operations
+    pub fn set_db(&mut self, db: Arc<ShardedDb>) {
+        self.db = Some(db);
+    }
+
+    /// Check if this node is the allocator for a given shard
+    #[inline]
+    fn is_allocator(&self, shard_id: u16) -> bool {
+        if self.num_nodes <= 1 {
+            return true;
+        }
+        let allocator_node = ((shard_id as usize) % self.num_nodes + 1) as u32;
+        allocator_node == self.config.node_id.as_u32()
     }
 
     /// Run the replication manager
@@ -182,7 +205,14 @@ impl ReplicationManager {
 
                 // Receive messages from peers
                 Some((addr, msg)) = msg_rx.recv() => {
-                    self.handle_peer_message(addr, msg);
+                    if let Some(response) = self.handle_peer_message(addr, msg) {
+                        // Send response back to the peer
+                        if let Some(writer) = self.writers.get_mut(&addr) {
+                            if let Err(e) = writer.send(&response).await {
+                                error!("Failed to send quota response to {}: {}", addr, e);
+                            }
+                        }
+                    }
                 }
 
                 // Periodic flush
@@ -222,22 +252,94 @@ impl ReplicationManager {
     }
 
     /// Handle a message from a peer
-    fn handle_peer_message(&mut self, addr: SocketAddr, msg: Message) {
+    /// Returns an optional response message to send back
+    fn handle_peer_message(&mut self, addr: SocketAddr, msg: Message) -> Option<Message> {
         match msg {
             Message::Ack { shard_id, acked_seq } => {
                 if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                     peer.update_acked(shard_id, acked_seq);
                     debug!("Peer {} acked shard {} seq {}", addr, shard_id, acked_seq);
                 }
+                None
             }
             Message::Hello { node_id } => {
                 if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                     peer.node_id = Some(node_id);
                     info!("Peer {} identified as node {}", addr, node_id.as_u32());
                 }
+                None
             }
             Message::DeltaBatch { .. } => {
                 // Inbound deltas are handled by the reader task directly
+                None
+            }
+            Message::QuotaRequest { shard_id, key, requested } => {
+                // Handle token request from a remote node
+                debug!(
+                    "Received QuotaRequest from {} for key {:?}, shard {}, requested {}",
+                    addr, key, shard_id, requested
+                );
+
+                // Process if we're the allocator for this shard
+                if self.is_allocator(shard_id) {
+                    if let Some(ref db) = self.db {
+                        // Get the requesting node's ID from peer state
+                        let from_node = self.outbound_peers.get(&addr)
+                            .and_then(|p| p.node_id)
+                            .unwrap_or_else(|| NodeId::new(0));
+
+                        // Try to grant tokens
+                        let batch_size = db.quota_batch_size(&key);
+                        let granted = db.allocator_grant(&key, from_node, batch_size.max(requested));
+
+                        if granted > 0 {
+                            debug!("Granting {} tokens for {:?} to node {}", granted, key, from_node.as_u32());
+                            return Some(Message::quota_grant(shard_id, key, granted));
+                        } else {
+                            debug!("Denying token request for {:?} to node {}", key, from_node.as_u32());
+                            return Some(Message::quota_deny(shard_id, key));
+                        }
+                    }
+                }
+                None
+            }
+            Message::QuotaGrant { shard_id, key, granted } => {
+                // Handle token grant from allocator - add tokens to local quota entry
+                debug!(
+                    "Received QuotaGrant from {} for key {:?}, shard {}, granted {}",
+                    addr, key, shard_id, granted
+                );
+
+                if let Some(ref db) = self.db {
+                    db.quota_add_tokens(&key, granted);
+                    info!("Added {} tokens for {:?}", granted, key);
+                }
+                None
+            }
+            Message::QuotaDeny { shard_id, key } => {
+                // Handle token denial from allocator
+                debug!(
+                    "Received QuotaDeny from {} for key {:?}, shard {}",
+                    addr, key, shard_id
+                );
+                // Request is denied, nothing to do - client already got -1
+                None
+            }
+            Message::QuotaSync { shard_id, key, limit, window_secs } => {
+                // Handle quota configuration sync from another node
+                debug!(
+                    "Received QuotaSync from {} for key {:?}, shard {}, limit {}, window {}s",
+                    addr, key, shard_id, limit, window_secs
+                );
+
+                // Create/update local quota entry if we don't have it
+                if let Some(ref db) = self.db {
+                    if !db.is_quota(&key) {
+                        db.quota_set(key, limit, window_secs);
+                        info!("Created quota from sync: limit={}, window={}s", limit, window_secs);
+                    }
+                }
+                None
             }
         }
     }
@@ -426,7 +528,12 @@ impl ReplicationManager {
                             // Note: We can't send acks here since we don't have the writer
                             // Acks will be sent by the peer when they receive our batches
                         }
-                        Message::Ack { .. } | Message::Hello { .. } => {
+                        Message::Ack { .. }
+                        | Message::Hello { .. }
+                        | Message::QuotaRequest { .. }
+                        | Message::QuotaGrant { .. }
+                        | Message::QuotaDeny { .. }
+                        | Message::QuotaSync { .. } => {
                             // Forward to manager for processing
                             if msg_tx.send((addr, msg)).await.is_err() {
                                 break;

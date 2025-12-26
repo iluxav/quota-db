@@ -1,5 +1,5 @@
 use crate::replication::Delta;
-use crate::types::NodeId;
+use crate::types::{Key, NodeId};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Message types for replication protocol
@@ -12,6 +12,14 @@ pub enum MessageType {
     Ack = 2,
     /// Initial handshake with node identity
     Hello = 3,
+    /// Request tokens from allocator (quota)
+    QuotaRequest = 4,
+    /// Grant tokens to requesting node (quota)
+    QuotaGrant = 5,
+    /// Deny token request (quota exhausted)
+    QuotaDeny = 6,
+    /// Sync quota configuration to other nodes
+    QuotaSync = 7,
 }
 
 impl MessageType {
@@ -20,6 +28,10 @@ impl MessageType {
             1 => Some(Self::DeltaBatch),
             2 => Some(Self::Ack),
             3 => Some(Self::Hello),
+            4 => Some(Self::QuotaRequest),
+            5 => Some(Self::QuotaGrant),
+            6 => Some(Self::QuotaDeny),
+            7 => Some(Self::QuotaSync),
             _ => None,
         }
     }
@@ -41,6 +53,30 @@ pub enum Message {
     /// Initial handshake
     Hello {
         node_id: NodeId,
+    },
+    /// Request tokens from allocator node
+    QuotaRequest {
+        shard_id: u16,
+        key: Key,
+        requested: u64,
+    },
+    /// Grant tokens to requesting node
+    QuotaGrant {
+        shard_id: u16,
+        key: Key,
+        granted: u64,
+    },
+    /// Deny token request (quota exhausted)
+    QuotaDeny {
+        shard_id: u16,
+        key: Key,
+    },
+    /// Sync quota configuration to other nodes
+    QuotaSync {
+        shard_id: u16,
+        key: Key,
+        limit: u64,
+        window_secs: u64,
     },
 }
 
@@ -69,6 +105,51 @@ impl Message {
             Message::Hello { node_id } => {
                 buf.put_u8(MessageType::Hello as u8);
                 buf.put_u32_le(node_id.as_u32());
+            }
+            Message::QuotaRequest {
+                shard_id,
+                key,
+                requested,
+            } => {
+                buf.put_u8(MessageType::QuotaRequest as u8);
+                buf.put_u16_le(*shard_id);
+                let key_bytes = key.as_bytes();
+                buf.put_u16_le(key_bytes.len() as u16);
+                buf.put_slice(key_bytes);
+                buf.put_u64_le(*requested);
+            }
+            Message::QuotaGrant {
+                shard_id,
+                key,
+                granted,
+            } => {
+                buf.put_u8(MessageType::QuotaGrant as u8);
+                buf.put_u16_le(*shard_id);
+                let key_bytes = key.as_bytes();
+                buf.put_u16_le(key_bytes.len() as u16);
+                buf.put_slice(key_bytes);
+                buf.put_u64_le(*granted);
+            }
+            Message::QuotaDeny { shard_id, key } => {
+                buf.put_u8(MessageType::QuotaDeny as u8);
+                buf.put_u16_le(*shard_id);
+                let key_bytes = key.as_bytes();
+                buf.put_u16_le(key_bytes.len() as u16);
+                buf.put_slice(key_bytes);
+            }
+            Message::QuotaSync {
+                shard_id,
+                key,
+                limit,
+                window_secs,
+            } => {
+                buf.put_u8(MessageType::QuotaSync as u8);
+                buf.put_u16_le(*shard_id);
+                let key_bytes = key.as_bytes();
+                buf.put_u16_le(key_bytes.len() as u16);
+                buf.put_slice(key_bytes);
+                buf.put_u64_le(*limit);
+                buf.put_u64_le(*window_secs);
             }
         }
 
@@ -125,6 +206,71 @@ impl Message {
                 let node_id = NodeId::new(buf.get_u32_le());
                 Some(Message::Hello { node_id })
             }
+            MessageType::QuotaRequest => {
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len + 8 {
+                    return None;
+                }
+                let key = Key::new(buf.copy_to_bytes(key_len));
+                let requested = buf.get_u64_le();
+                Some(Message::QuotaRequest {
+                    shard_id,
+                    key,
+                    requested,
+                })
+            }
+            MessageType::QuotaGrant => {
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len + 8 {
+                    return None;
+                }
+                let key = Key::new(buf.copy_to_bytes(key_len));
+                let granted = buf.get_u64_le();
+                Some(Message::QuotaGrant {
+                    shard_id,
+                    key,
+                    granted,
+                })
+            }
+            MessageType::QuotaDeny => {
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len {
+                    return None;
+                }
+                let key = Key::new(buf.copy_to_bytes(key_len));
+                Some(Message::QuotaDeny { shard_id, key })
+            }
+            MessageType::QuotaSync => {
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len + 16 {
+                    return None;
+                }
+                let key = Key::new(buf.copy_to_bytes(key_len));
+                let limit = buf.get_u64_le();
+                let window_secs = buf.get_u64_le();
+                Some(Message::QuotaSync {
+                    shard_id,
+                    key,
+                    limit,
+                    window_secs,
+                })
+            }
         }
     }
 
@@ -141,6 +287,39 @@ impl Message {
     /// Create a Hello message
     pub fn hello(node_id: NodeId) -> Self {
         Message::Hello { node_id }
+    }
+
+    /// Create a QuotaRequest message
+    pub fn quota_request(shard_id: u16, key: Key, requested: u64) -> Self {
+        Message::QuotaRequest {
+            shard_id,
+            key,
+            requested,
+        }
+    }
+
+    /// Create a QuotaGrant message
+    pub fn quota_grant(shard_id: u16, key: Key, granted: u64) -> Self {
+        Message::QuotaGrant {
+            shard_id,
+            key,
+            granted,
+        }
+    }
+
+    /// Create a QuotaDeny message
+    pub fn quota_deny(shard_id: u16, key: Key) -> Self {
+        Message::QuotaDeny { shard_id, key }
+    }
+
+    /// Create a QuotaSync message
+    pub fn quota_sync(shard_id: u16, key: Key, limit: u64, window_secs: u64) -> Self {
+        Message::QuotaSync {
+            shard_id,
+            key,
+            limit,
+            window_secs,
+        }
     }
 
     /// Get the number of deltas in a DeltaBatch (0 for other message types)
@@ -283,5 +462,98 @@ mod tests {
         assert!(matches!(decoded2, Message::Ack { .. }));
 
         assert!(decoder.decode().is_none());
+    }
+
+    #[test]
+    fn test_quota_request_encode_decode() {
+        let msg = Message::quota_request(5, Key::from("api:user:123"), 1000);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::QuotaRequest {
+                shard_id,
+                key,
+                requested,
+            } => {
+                assert_eq!(shard_id, 5);
+                assert_eq!(key.as_bytes(), b"api:user:123");
+                assert_eq!(requested, 1000);
+            }
+            _ => panic!("Expected QuotaRequest message"),
+        }
+    }
+
+    #[test]
+    fn test_quota_grant_encode_decode() {
+        let msg = Message::quota_grant(5, Key::from("api:user:123"), 500);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::QuotaGrant {
+                shard_id,
+                key,
+                granted,
+            } => {
+                assert_eq!(shard_id, 5);
+                assert_eq!(key.as_bytes(), b"api:user:123");
+                assert_eq!(granted, 500);
+            }
+            _ => panic!("Expected QuotaGrant message"),
+        }
+    }
+
+    #[test]
+    fn test_quota_deny_encode_decode() {
+        let msg = Message::quota_deny(5, Key::from("api:user:123"));
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::QuotaDeny { shard_id, key } => {
+                assert_eq!(shard_id, 5);
+                assert_eq!(key.as_bytes(), b"api:user:123");
+            }
+            _ => panic!("Expected QuotaDeny message"),
+        }
+    }
+
+    #[test]
+    fn test_quota_sync_encode_decode() {
+        let msg = Message::quota_sync(5, Key::from("api:user:123"), 10000, 60);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::QuotaSync {
+                shard_id,
+                key,
+                limit,
+                window_secs,
+            } => {
+                assert_eq!(shard_id, 5);
+                assert_eq!(key.as_bytes(), b"api:user:123");
+                assert_eq!(limit, 10000);
+                assert_eq!(window_secs, 60);
+            }
+            _ => panic!("Expected QuotaSync message"),
+        }
     }
 }

@@ -31,6 +31,15 @@ pub enum Command {
     /// SET key value (for compatibility - sets counter to value)
     Set(Key, i64),
 
+    /// QUOTASET key limit window_secs - set up a rate limit
+    QuotaSet(Key, u64, u64),
+
+    /// QUOTAGET key - get quota info (limit, window_secs, remaining)
+    QuotaGet(Key),
+
+    /// QUOTADEL key - delete quota, convert back to regular key
+    QuotaDel(Key),
+
     /// CONFIG GET param - returns param name and empty value for compatibility
     ConfigGet(Bytes),
 
@@ -107,6 +116,23 @@ impl Command {
                 let value = Self::extract_i64(&array, 2)?;
                 Ok(Command::Set(key, value))
             }
+            b"QUOTASET" => {
+                Self::ensure_args(&array, 4, "QUOTASET")?;
+                let key = Self::extract_key(&array, 1)?;
+                let limit = Self::extract_u64(&array, 2)?;
+                let window_secs = Self::extract_u64(&array, 3)?;
+                Ok(Command::QuotaSet(key, limit, window_secs))
+            }
+            b"QUOTAGET" => {
+                Self::ensure_args(&array, 2, "QUOTAGET")?;
+                let key = Self::extract_key(&array, 1)?;
+                Ok(Command::QuotaGet(key))
+            }
+            b"QUOTADEL" => {
+                Self::ensure_args(&array, 2, "QUOTADEL")?;
+                let key = Self::extract_key(&array, 1)?;
+                Ok(Command::QuotaDel(key))
+            }
             b"CONFIG" => {
                 // CONFIG GET param or CONFIG SET param value
                 if array.len() >= 3 {
@@ -172,6 +198,21 @@ impl Command {
         }
     }
 
+    /// Extract a u64 from the array at the given index
+    fn extract_u64(array: &[Frame], idx: usize) -> Result<u64> {
+        match array.get(idx) {
+            Some(Frame::Bulk(b)) => std::str::from_utf8(b)
+                .map_err(|_| Error::InvalidArgument("invalid utf8".into()))?
+                .parse::<u64>()
+                .map_err(|_| Error::InvalidArgument("value is not a positive integer".into())),
+            Some(Frame::Integer(i)) if *i >= 0 => Ok(*i as u64),
+            Some(Frame::Integer(_)) => {
+                Err(Error::InvalidArgument("value must be positive".into()))
+            }
+            _ => Err(Error::InvalidArgument("expected positive integer".into())),
+        }
+    }
+
     /// Get the command name for logging/debugging
     pub fn name(&self) -> &'static str {
         match self {
@@ -182,6 +223,9 @@ impl Command {
             Command::Decr(_) => "DECR",
             Command::DecrBy(_, _) => "DECRBY",
             Command::Set(_, _) => "SET",
+            Command::QuotaSet(_, _, _) => "QUOTASET",
+            Command::QuotaGet(_) => "QUOTAGET",
+            Command::QuotaDel(_) => "QUOTADEL",
             Command::ConfigGet(_) => "CONFIG GET",
             Command::ConfigSet => "CONFIG SET",
             Command::DbSize => "DBSIZE",

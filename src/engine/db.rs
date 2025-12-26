@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 
 use crate::config::Config;
+use crate::engine::shard::QuotaResult;
 use crate::engine::Shard;
 use crate::replication::Delta;
 use crate::types::{Key, NodeId};
@@ -89,6 +90,62 @@ impl ShardedDb {
         self.shards[idx].write().set(key, value);
     }
 
+    // ========== Quota Operations ==========
+
+    /// Set up a quota for a key.
+    pub fn quota_set(&self, key: Key, limit: u64, window_secs: u64) {
+        let idx = self.shard_index(&key);
+        self.shards[idx].write().quota_set(key, limit, window_secs);
+    }
+
+    /// Get quota info for a key: (limit, window_secs, remaining).
+    pub fn quota_get(&self, key: &Key) -> Option<(u64, u64, i64)> {
+        let idx = self.shard_index(key);
+        self.shards[idx].read().quota_get(key)
+    }
+
+    /// Delete a quota.
+    pub fn quota_del(&self, key: &Key) -> bool {
+        let idx = self.shard_index(key);
+        self.shards[idx].write().quota_del(key)
+    }
+
+    /// Check if a key is a quota.
+    pub fn is_quota(&self, key: &Key) -> bool {
+        let idx = self.shard_index(key);
+        self.shards[idx].read().is_quota(key)
+    }
+
+    /// Try to consume tokens from a quota.
+    /// For single-node operation, this also acts as the allocator.
+    pub fn quota_consume(&self, key: &Key, amount: u64) -> QuotaResult {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+
+        // First try local consumption
+        let result = shard.quota_consume(key, amount);
+
+        match result {
+            QuotaResult::NeedTokens => {
+                // In single-node mode, we are the allocator
+                // Request tokens from ourselves
+                let batch_size = shard.quota_batch_size(key);
+                let granted = shard.allocator_grant(key, self.node_id, batch_size);
+
+                if granted > 0 {
+                    // Add tokens to local balance
+                    shard.quota_add_tokens(key, granted);
+                    // Try consumption again
+                    shard.quota_consume(key, amount)
+                } else {
+                    // No tokens available from allocator
+                    QuotaResult::Denied
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Set expiration for a key.
     pub fn expire(&self, key: Key, expires_at: u64) {
         let idx = self.shard_index(&key);
@@ -112,6 +169,25 @@ impl ShardedDb {
     /// Get per-shard entry counts (for metrics).
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards.iter().map(|s| s.read().len()).collect()
+    }
+
+    /// Get the batch size for quota token requests.
+    pub fn quota_batch_size(&self, key: &Key) -> u64 {
+        let idx = self.shard_index(key);
+        self.shards[idx].read().quota_batch_size(key)
+    }
+
+    /// Grant tokens from allocator to a node.
+    /// Returns the number of tokens granted.
+    pub fn allocator_grant(&self, key: &Key, to_node: NodeId, requested: u64) -> u64 {
+        let idx = self.shard_index(key);
+        self.shards[idx].write().allocator_grant(key, to_node, requested)
+    }
+
+    /// Add tokens to local quota balance (received from remote allocator).
+    pub fn quota_add_tokens(&self, key: &Key, amount: u64) {
+        let idx = self.shard_index(key);
+        self.shards[idx].write().quota_add_tokens(key, amount);
     }
 }
 

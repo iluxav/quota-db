@@ -1,6 +1,78 @@
 use rustc_hash::FxHashMap;
 
+use crate::engine::quota::QuotaEntry;
 use crate::types::NodeId;
+
+/// Entry type in the database - either a PN-Counter or a Quota.
+#[derive(Debug, Clone)]
+pub enum Entry {
+    /// PN-Counter CRDT for eventual consistency counting
+    Counter(PnCounterEntry),
+    /// Quota/rate-limit entry with token bucket semantics
+    Quota(QuotaEntry),
+}
+
+impl Entry {
+    /// Check if this is a quota entry.
+    #[inline]
+    pub fn is_quota(&self) -> bool {
+        matches!(self, Entry::Quota(_))
+    }
+
+    /// Check if this is a counter entry.
+    #[inline]
+    pub fn is_counter(&self) -> bool {
+        matches!(self, Entry::Counter(_))
+    }
+
+    /// Get as counter reference, if it is one.
+    #[inline]
+    pub fn as_counter(&self) -> Option<&PnCounterEntry> {
+        match self {
+            Entry::Counter(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Get as counter mutable reference, if it is one.
+    #[inline]
+    pub fn as_counter_mut(&mut self) -> Option<&mut PnCounterEntry> {
+        match self {
+            Entry::Counter(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Get as quota reference, if it is one.
+    #[inline]
+    pub fn as_quota(&self) -> Option<&QuotaEntry> {
+        match self {
+            Entry::Quota(q) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// Get as quota mutable reference, if it is one.
+    #[inline]
+    pub fn as_quota_mut(&mut self) -> Option<&mut QuotaEntry> {
+        match self {
+            Entry::Quota(q) => Some(q),
+            _ => None,
+        }
+    }
+}
+
+impl From<PnCounterEntry> for Entry {
+    fn from(counter: PnCounterEntry) -> Self {
+        Entry::Counter(counter)
+    }
+}
+
+impl From<QuotaEntry> for Entry {
+    fn from(quota: QuotaEntry) -> Self {
+        Entry::Quota(quota)
+    }
+}
 
 /// PN-Counter CRDT entry with dynamic region support.
 ///

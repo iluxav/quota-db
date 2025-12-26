@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::engine::ShardedDb;
+use crate::engine::{QuotaResult, ShardedDb};
 use crate::error::Result;
 use crate::protocol::{Command, Frame};
 use crate::replication::ReplicationHandle;
@@ -86,18 +86,52 @@ impl Handler {
                 None => Frame::Null,
             },
             Command::Incr(key) => {
-                let (shard_id, value, delta) = self.db.increment(key, 1);
-                self.replicate(shard_id, delta);
-                Frame::integer(value)
+                // Check if this is a quota key first
+                if self.db.is_quota(&key) {
+                    match self.db.quota_consume(&key, 1) {
+                        QuotaResult::Allowed(remaining) => Frame::integer(remaining),
+                        QuotaResult::Denied => Frame::integer(-1),
+                        QuotaResult::NeedTokens => Frame::integer(-1), // Should not happen after quota_consume
+                        QuotaResult::NotQuota => {
+                            // Race: became non-quota, fall through to regular increment
+                            let (shard_id, value, delta) = self.db.increment(key, 1);
+                            self.replicate(shard_id, delta);
+                            Frame::integer(value)
+                        }
+                    }
+                } else {
+                    let (shard_id, value, delta) = self.db.increment(key, 1);
+                    self.replicate(shard_id, delta);
+                    Frame::integer(value)
+                }
             }
             Command::IncrBy(key, delta) => {
-                let (shard_id, value, rep_delta) = if delta >= 0 {
-                    self.db.increment(key, delta as u64)
+                // Check if this is a quota key first
+                if self.db.is_quota(&key) {
+                    if delta <= 0 {
+                        // DECRBY on quota doesn't make sense
+                        return Frame::error("ERR DECRBY not supported on quota keys");
+                    }
+                    match self.db.quota_consume(&key, delta as u64) {
+                        QuotaResult::Allowed(remaining) => Frame::integer(remaining),
+                        QuotaResult::Denied => Frame::integer(-1),
+                        QuotaResult::NeedTokens => Frame::integer(-1),
+                        QuotaResult::NotQuota => {
+                            // Race: became non-quota, fall through to regular increment
+                            let (shard_id, value, rep_delta) = self.db.increment(key, delta as u64);
+                            self.replicate(shard_id, rep_delta);
+                            Frame::integer(value)
+                        }
+                    }
                 } else {
-                    self.db.decrement(key, (-delta) as u64)
-                };
-                self.replicate(shard_id, rep_delta);
-                Frame::integer(value)
+                    let (shard_id, value, rep_delta) = if delta >= 0 {
+                        self.db.increment(key, delta as u64)
+                    } else {
+                        self.db.decrement(key, (-delta) as u64)
+                    };
+                    self.replicate(shard_id, rep_delta);
+                    Frame::integer(value)
+                }
             }
             Command::Decr(key) => {
                 let (shard_id, value, delta) = self.db.decrement(key, 1);
@@ -117,6 +151,25 @@ impl Handler {
                 self.db.set(key, value);
                 // TODO: SET doesn't emit a delta in current implementation
                 Frame::ok()
+            }
+            Command::QuotaSet(key, limit, window_secs) => {
+                self.db.quota_set(key, limit, window_secs);
+                Frame::ok()
+            }
+            Command::QuotaGet(key) => match self.db.quota_get(&key) {
+                Some((limit, window_secs, remaining)) => Frame::Array(vec![
+                    Frame::integer(limit as i64),
+                    Frame::integer(window_secs as i64),
+                    Frame::integer(remaining),
+                ]),
+                None => Frame::Null,
+            },
+            Command::QuotaDel(key) => {
+                if self.db.quota_del(&key) {
+                    Frame::integer(1)
+                } else {
+                    Frame::integer(0)
+                }
             }
             Command::ConfigGet(param) => {
                 // Return [param_name, value] for CONFIG GET
