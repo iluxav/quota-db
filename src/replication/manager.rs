@@ -341,6 +341,16 @@ impl ReplicationManager {
                 }
                 None
             }
+            // Anti-entropy messages - will be handled by the anti-entropy subsystem
+            Message::Status { .. } |
+            Message::DeltaRequest { .. } |
+            Message::DigestExchange { .. } |
+            Message::SnapshotRequest { .. } |
+            Message::Snapshot { .. } => {
+                // Anti-entropy messages are handled separately
+                debug!("Received anti-entropy message from {}, ignoring in base handler", addr);
+                None
+            }
         }
     }
 
@@ -533,7 +543,12 @@ impl ReplicationManager {
                         | Message::QuotaRequest { .. }
                         | Message::QuotaGrant { .. }
                         | Message::QuotaDeny { .. }
-                        | Message::QuotaSync { .. } => {
+                        | Message::QuotaSync { .. }
+                        | Message::Status { .. }
+                        | Message::DeltaRequest { .. }
+                        | Message::DigestExchange { .. }
+                        | Message::SnapshotRequest { .. }
+                        | Message::Snapshot { .. } => {
                             // Forward to manager for processing
                             if msg_tx.send((addr, msg)).await.is_err() {
                                 break;

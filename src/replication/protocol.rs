@@ -20,6 +20,16 @@ pub enum MessageType {
     QuotaDeny = 6,
     /// Sync quota configuration to other nodes
     QuotaSync = 7,
+    /// Anti-entropy: Status exchange with shard sequence numbers
+    Status = 8,
+    /// Anti-entropy: Request missing deltas for a shard
+    DeltaRequest = 9,
+    /// Anti-entropy: Exchange digest for shard verification
+    DigestExchange = 10,
+    /// Anti-entropy: Request full snapshot for a shard
+    SnapshotRequest = 11,
+    /// Anti-entropy: Full snapshot of a shard
+    Snapshot = 12,
 }
 
 impl MessageType {
@@ -32,6 +42,11 @@ impl MessageType {
             5 => Some(Self::QuotaGrant),
             6 => Some(Self::QuotaDeny),
             7 => Some(Self::QuotaSync),
+            8 => Some(Self::Status),
+            9 => Some(Self::DeltaRequest),
+            10 => Some(Self::DigestExchange),
+            11 => Some(Self::SnapshotRequest),
+            12 => Some(Self::Snapshot),
             _ => None,
         }
     }
@@ -77,6 +92,33 @@ pub enum Message {
         key: Key,
         limit: u64,
         window_secs: u64,
+    },
+    /// Anti-entropy: Status exchange with shard sequence numbers
+    Status {
+        shard_seqs: Vec<(u16, u64)>,
+    },
+    /// Anti-entropy: Request missing deltas for a shard
+    DeltaRequest {
+        shard_id: u16,
+        from_seq: u64,
+        to_seq: u64,
+    },
+    /// Anti-entropy: Exchange digest for shard verification
+    DigestExchange {
+        shard_id: u16,
+        head_seq: u64,
+        digest: u64,
+    },
+    /// Anti-entropy: Request full snapshot for a shard
+    SnapshotRequest {
+        shard_id: u16,
+    },
+    /// Anti-entropy: Full snapshot of a shard
+    Snapshot {
+        shard_id: u16,
+        head_seq: u64,
+        digest: u64,
+        entries: Vec<(Key, i64)>,
     },
 }
 
@@ -150,6 +192,56 @@ impl Message {
                 buf.put_slice(key_bytes);
                 buf.put_u64_le(*limit);
                 buf.put_u64_le(*window_secs);
+            }
+            Message::Status { shard_seqs } => {
+                buf.put_u8(MessageType::Status as u8);
+                buf.put_u16_le(shard_seqs.len() as u16);
+                for (shard_id, seq) in shard_seqs {
+                    buf.put_u16_le(*shard_id);
+                    buf.put_u64_le(*seq);
+                }
+            }
+            Message::DeltaRequest {
+                shard_id,
+                from_seq,
+                to_seq,
+            } => {
+                buf.put_u8(MessageType::DeltaRequest as u8);
+                buf.put_u16_le(*shard_id);
+                buf.put_u64_le(*from_seq);
+                buf.put_u64_le(*to_seq);
+            }
+            Message::DigestExchange {
+                shard_id,
+                head_seq,
+                digest,
+            } => {
+                buf.put_u8(MessageType::DigestExchange as u8);
+                buf.put_u16_le(*shard_id);
+                buf.put_u64_le(*head_seq);
+                buf.put_u64_le(*digest);
+            }
+            Message::SnapshotRequest { shard_id } => {
+                buf.put_u8(MessageType::SnapshotRequest as u8);
+                buf.put_u16_le(*shard_id);
+            }
+            Message::Snapshot {
+                shard_id,
+                head_seq,
+                digest,
+                entries,
+            } => {
+                buf.put_u8(MessageType::Snapshot as u8);
+                buf.put_u16_le(*shard_id);
+                buf.put_u64_le(*head_seq);
+                buf.put_u64_le(*digest);
+                buf.put_u32_le(entries.len() as u32);
+                for (key, value) in entries {
+                    let key_bytes = key.as_bytes();
+                    buf.put_u16_le(key_bytes.len() as u16);
+                    buf.put_slice(key_bytes);
+                    buf.put_i64_le(*value);
+                }
             }
         }
 
@@ -271,6 +363,87 @@ impl Message {
                     window_secs,
                 })
             }
+            MessageType::Status => {
+                if buf.remaining() < 2 {
+                    return None;
+                }
+                let count = buf.get_u16_le() as usize;
+                // Each entry is shard_id(2) + seq(8) = 10 bytes
+                if buf.remaining() < count * 10 {
+                    return None;
+                }
+                let mut shard_seqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let shard_id = buf.get_u16_le();
+                    let seq = buf.get_u64_le();
+                    shard_seqs.push((shard_id, seq));
+                }
+                Some(Message::Status { shard_seqs })
+            }
+            MessageType::DeltaRequest => {
+                // shard_id(2) + from_seq(8) + to_seq(8) = 18 bytes
+                if buf.remaining() < 18 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let from_seq = buf.get_u64_le();
+                let to_seq = buf.get_u64_le();
+                Some(Message::DeltaRequest {
+                    shard_id,
+                    from_seq,
+                    to_seq,
+                })
+            }
+            MessageType::DigestExchange => {
+                // shard_id(2) + head_seq(8) + digest(8) = 18 bytes
+                if buf.remaining() < 18 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let head_seq = buf.get_u64_le();
+                let digest = buf.get_u64_le();
+                Some(Message::DigestExchange {
+                    shard_id,
+                    head_seq,
+                    digest,
+                })
+            }
+            MessageType::SnapshotRequest => {
+                if buf.remaining() < 2 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                Some(Message::SnapshotRequest { shard_id })
+            }
+            MessageType::Snapshot => {
+                // shard_id(2) + head_seq(8) + digest(8) + count(4) = 22 bytes minimum
+                if buf.remaining() < 22 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let head_seq = buf.get_u64_le();
+                let digest = buf.get_u64_le();
+                let count = buf.get_u32_le() as usize;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if buf.remaining() < 2 {
+                        return None;
+                    }
+                    let key_len = buf.get_u16_le() as usize;
+                    if buf.remaining() < key_len + 8 {
+                        return None;
+                    }
+                    let key = Key::new(buf.copy_to_bytes(key_len));
+                    let value = buf.get_i64_le();
+                    entries.push((key, value));
+                }
+                Some(Message::Snapshot {
+                    shard_id,
+                    head_seq,
+                    digest,
+                    entries,
+                })
+            }
         }
     }
 
@@ -319,6 +492,44 @@ impl Message {
             key,
             limit,
             window_secs,
+        }
+    }
+
+    /// Create a Status message for anti-entropy
+    pub fn status(shard_seqs: Vec<(u16, u64)>) -> Self {
+        Message::Status { shard_seqs }
+    }
+
+    /// Create a DeltaRequest message for anti-entropy
+    pub fn delta_request(shard_id: u16, from_seq: u64, to_seq: u64) -> Self {
+        Message::DeltaRequest {
+            shard_id,
+            from_seq,
+            to_seq,
+        }
+    }
+
+    /// Create a DigestExchange message for anti-entropy
+    pub fn digest_exchange(shard_id: u16, head_seq: u64, digest: u64) -> Self {
+        Message::DigestExchange {
+            shard_id,
+            head_seq,
+            digest,
+        }
+    }
+
+    /// Create a SnapshotRequest message for anti-entropy
+    pub fn snapshot_request(shard_id: u16) -> Self {
+        Message::SnapshotRequest { shard_id }
+    }
+
+    /// Create a Snapshot message for anti-entropy
+    pub fn snapshot(shard_id: u16, head_seq: u64, digest: u64, entries: Vec<(Key, i64)>) -> Self {
+        Message::Snapshot {
+            shard_id,
+            head_seq,
+            digest,
+            entries,
         }
     }
 
@@ -554,6 +765,175 @@ mod tests {
                 assert_eq!(window_secs, 60);
             }
             _ => panic!("Expected QuotaSync message"),
+        }
+    }
+
+    #[test]
+    fn test_status_encode_decode() {
+        let shard_seqs = vec![(0, 100), (1, 200), (5, 50)];
+        let msg = Message::status(shard_seqs.clone());
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::Status { shard_seqs: decoded_seqs } => {
+                assert_eq!(decoded_seqs.len(), 3);
+                assert_eq!(decoded_seqs[0], (0, 100));
+                assert_eq!(decoded_seqs[1], (1, 200));
+                assert_eq!(decoded_seqs[2], (5, 50));
+            }
+            _ => panic!("Expected Status message"),
+        }
+    }
+
+    #[test]
+    fn test_status_encode_decode_empty() {
+        let msg = Message::status(vec![]);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::Status { shard_seqs } => {
+                assert!(shard_seqs.is_empty());
+            }
+            _ => panic!("Expected Status message"),
+        }
+    }
+
+    #[test]
+    fn test_delta_request_encode_decode() {
+        let msg = Message::delta_request(7, 100, 200);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::DeltaRequest {
+                shard_id,
+                from_seq,
+                to_seq,
+            } => {
+                assert_eq!(shard_id, 7);
+                assert_eq!(from_seq, 100);
+                assert_eq!(to_seq, 200);
+            }
+            _ => panic!("Expected DeltaRequest message"),
+        }
+    }
+
+    #[test]
+    fn test_digest_exchange_encode_decode() {
+        let msg = Message::digest_exchange(3, 500, 0xDEADBEEF12345678);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::DigestExchange {
+                shard_id,
+                head_seq,
+                digest,
+            } => {
+                assert_eq!(shard_id, 3);
+                assert_eq!(head_seq, 500);
+                assert_eq!(digest, 0xDEADBEEF12345678);
+            }
+            _ => panic!("Expected DigestExchange message"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_request_encode_decode() {
+        let msg = Message::snapshot_request(12);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::SnapshotRequest { shard_id } => {
+                assert_eq!(shard_id, 12);
+            }
+            _ => panic!("Expected SnapshotRequest message"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_encode_decode() {
+        let entries = vec![
+            (Key::from("counter:a"), 100i64),
+            (Key::from("counter:b"), -50i64),
+            (Key::from("counter:c"), 0i64),
+        ];
+        let msg = Message::snapshot(5, 1000, 0xCAFEBABE, entries);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::Snapshot {
+                shard_id,
+                head_seq,
+                digest,
+                entries,
+            } => {
+                assert_eq!(shard_id, 5);
+                assert_eq!(head_seq, 1000);
+                assert_eq!(digest, 0xCAFEBABE);
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].0.as_bytes(), b"counter:a");
+                assert_eq!(entries[0].1, 100);
+                assert_eq!(entries[1].0.as_bytes(), b"counter:b");
+                assert_eq!(entries[1].1, -50);
+                assert_eq!(entries[2].0.as_bytes(), b"counter:c");
+                assert_eq!(entries[2].1, 0);
+            }
+            _ => panic!("Expected Snapshot message"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_encode_decode_empty() {
+        let msg = Message::snapshot(2, 0, 0, vec![]);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::Snapshot {
+                shard_id,
+                head_seq,
+                digest,
+                entries,
+            } => {
+                assert_eq!(shard_id, 2);
+                assert_eq!(head_seq, 0);
+                assert_eq!(digest, 0);
+                assert!(entries.is_empty());
+            }
+            _ => panic!("Expected Snapshot message"),
         }
     }
 }
