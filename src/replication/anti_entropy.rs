@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustc_hash::FxHashSet;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::engine::ShardedDb;
 use crate::replication::Message;
+use crate::types::Key;
 
 /// Configuration for anti-entropy system
 #[derive(Debug, Clone)]
@@ -213,6 +214,140 @@ impl AntiEntropyTask {
     /// Get the snapshot threshold from configuration
     pub fn snapshot_threshold(&self) -> u8 {
         self.config.snapshot_threshold
+    }
+
+    // ========== Message Handling Methods ==========
+
+    /// Handle incoming Status message from a peer
+    /// Returns delta requests for shards where we're behind
+    pub fn handle_status(&mut self, from: SocketAddr, shard_seqs: Vec<(u16, u64)>) -> Vec<Message> {
+        let mut responses = Vec::new();
+
+        let peer = self.peer_state.entry(from).or_insert_with(|| {
+            PeerAntiEntropyState::new(self.num_shards)
+        });
+
+        for (shard_id, remote_seq) in shard_seqs {
+            let shard_idx = shard_id as usize;
+            if shard_idx >= self.num_shards {
+                continue;
+            }
+
+            peer.update_remote_seq(shard_id, remote_seq);
+            let local_seq = self.db.shard_head_seq(shard_idx);
+
+            if local_seq < remote_seq {
+                // We're behind - request missing deltas
+                debug!(
+                    "Shard {} behind: local={} remote={}, requesting deltas",
+                    shard_id, local_seq, remote_seq
+                );
+                responses.push(Message::delta_request(shard_id, local_seq, remote_seq));
+            }
+        }
+
+        responses
+    }
+
+    /// Handle incoming DigestExchange message from a peer
+    /// Returns SnapshotRequest if threshold exceeded
+    pub fn handle_digest_exchange(
+        &mut self,
+        from: SocketAddr,
+        shard_id: u16,
+        remote_seq: u64,
+        remote_digest: u64,
+    ) -> Option<Message> {
+        let shard_idx = shard_id as usize;
+        if shard_idx >= self.num_shards {
+            return None;
+        }
+
+        let local_seq = self.db.shard_head_seq(shard_idx);
+        let local_digest = self.db.shard_digest(shard_idx);
+
+        let peer = self.peer_state.entry(from).or_insert_with(|| {
+            PeerAntiEntropyState::new(self.num_shards)
+        });
+
+        // Only compare if sequences match
+        if local_seq == remote_seq {
+            if local_digest != remote_digest {
+                // Digest mismatch
+                let count = peer.increment_mismatch(shard_id);
+                warn!(
+                    "Shard {} digest mismatch with {} (count={}): local={:x} remote={:x}",
+                    shard_id, from, count, local_digest, remote_digest
+                );
+
+                if count >= self.config.snapshot_threshold && !peer.is_snapshot_pending(shard_id) {
+                    info!("Shard {} requesting snapshot from {} after {} mismatches",
+                          shard_id, from, count);
+                    peer.mark_snapshot_pending(shard_id);
+                    return Some(Message::snapshot_request(shard_id));
+                }
+            } else {
+                // Digests match - reset mismatch count
+                peer.reset_mismatch(shard_id);
+            }
+        }
+
+        None
+    }
+
+    /// Handle incoming Snapshot message - apply to local shard
+    pub fn handle_snapshot(
+        &mut self,
+        from: SocketAddr,
+        shard_id: u16,
+        head_seq: u64,
+        _digest: u64,
+        entries: Vec<(Key, i64)>,
+    ) {
+        let shard_idx = shard_id as usize;
+        if shard_idx >= self.num_shards {
+            return;
+        }
+
+        info!(
+            "Applying snapshot for shard {} from {}: {} entries, seq={}",
+            shard_id, from, entries.len(), head_seq
+        );
+
+        self.db.apply_shard_snapshot(shard_idx, head_seq, entries);
+
+        // Clear pending state
+        if let Some(peer) = self.peer_state.get_mut(&from) {
+            peer.clear_snapshot_pending(shard_id);
+            peer.reset_mismatch(shard_id);
+        }
+    }
+
+    /// Handle incoming SnapshotRequest - create and return snapshot
+    pub fn handle_snapshot_request(&self, shard_id: u16) -> Option<Message> {
+        let shard_idx = shard_id as usize;
+        if shard_idx >= self.num_shards {
+            return None;
+        }
+
+        if let Some((head_seq, digest, entries)) = self.db.create_shard_snapshot(shard_idx) {
+            info!("Creating snapshot for shard {}: {} entries", shard_id, entries.len());
+            Some(Message::snapshot(shard_id, head_seq, digest, entries))
+        } else {
+            None
+        }
+    }
+
+    /// Build digest exchange messages for all shards
+    pub fn build_digest_messages(&self) -> Vec<Message> {
+        (0..self.num_shards)
+            .map(|i| {
+                let shard_id = i as u16;
+                let head_seq = self.db.shard_head_seq(i);
+                let digest = self.db.shard_digest(i);
+                Message::digest_exchange(shard_id, head_seq, digest)
+            })
+            .collect()
     }
 }
 
@@ -469,5 +604,311 @@ mod tests {
 
         // Should wrap to 0
         assert_eq!(task.cycle_count(), 0);
+    }
+
+    // ========== Message Handling Tests ==========
+
+    #[test]
+    fn test_handle_status_detects_gap() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Peer is ahead on shard 0
+        let responses = task.handle_status(peer, vec![(0, 100)]);
+
+        // Should request deltas
+        assert_eq!(responses.len(), 1);
+        match &responses[0] {
+            Message::DeltaRequest { shard_id, from_seq, to_seq } => {
+                assert_eq!(*shard_id, 0);
+                assert_eq!(*from_seq, 0);
+                assert_eq!(*to_seq, 100);
+            }
+            _ => panic!("Expected DeltaRequest"),
+        }
+    }
+
+    #[test]
+    fn test_handle_status_no_gap() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Peer has same seq as us (0)
+        let responses = task.handle_status(peer, vec![(0, 0)]);
+
+        // Should not request any deltas
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn test_handle_status_multiple_shards() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Peer is ahead on shards 0 and 2
+        let responses = task.handle_status(peer, vec![(0, 50), (1, 0), (2, 75), (3, 0)]);
+
+        // Should request deltas for shards 0 and 2
+        assert_eq!(responses.len(), 2);
+
+        // Check shard 0 request
+        match &responses[0] {
+            Message::DeltaRequest { shard_id, from_seq, to_seq } => {
+                assert_eq!(*shard_id, 0);
+                assert_eq!(*from_seq, 0);
+                assert_eq!(*to_seq, 50);
+            }
+            _ => panic!("Expected DeltaRequest for shard 0"),
+        }
+
+        // Check shard 2 request
+        match &responses[1] {
+            Message::DeltaRequest { shard_id, from_seq, to_seq } => {
+                assert_eq!(*shard_id, 2);
+                assert_eq!(*from_seq, 0);
+                assert_eq!(*to_seq, 75);
+            }
+            _ => panic!("Expected DeltaRequest for shard 2"),
+        }
+    }
+
+    #[test]
+    fn test_handle_status_out_of_bounds_shard() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Peer reports a shard id that's out of bounds (we only have 4 shards)
+        let responses = task.handle_status(peer, vec![(100, 50)]);
+
+        // Should not request any deltas for out-of-bounds shard
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn test_handle_digest_mismatch_triggers_snapshot() {
+        let db = create_test_db();
+        let mut config = AntiEntropyConfig::default();
+        config.snapshot_threshold = 2;
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // First mismatch - no snapshot yet
+        let resp1 = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        assert!(resp1.is_none());
+
+        // Second mismatch - should trigger snapshot request
+        let resp2 = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        assert!(resp2.is_some());
+        match resp2.unwrap() {
+            Message::SnapshotRequest { shard_id } => assert_eq!(shard_id, 0),
+            _ => panic!("Expected SnapshotRequest"),
+        }
+    }
+
+    #[test]
+    fn test_handle_digest_match_resets_mismatch() {
+        let db = create_test_db();
+        let mut config = AntiEntropyConfig::default();
+        config.snapshot_threshold = 3;
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Two mismatches
+        task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+
+        // Now a match (digest = 0, which is what the empty shard has)
+        let local_digest = task.db.shard_digest(0);
+        task.handle_digest_exchange(peer, 0, 0, local_digest);
+
+        // Mismatch count should be reset
+        assert_eq!(task.peer_state(&peer).unwrap().mismatch_count(0), 0);
+
+        // Another mismatch should not trigger snapshot (count reset)
+        let resp = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn test_handle_digest_seq_mismatch_no_compare() {
+        let db = create_test_db();
+        let mut config = AntiEntropyConfig::default();
+        config.snapshot_threshold = 1;
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Digest mismatch but sequences don't match - should not trigger snapshot
+        // Local seq is 0, remote seq is 100
+        let resp = task.handle_digest_exchange(peer, 0, 100, 0xDEAD);
+        assert!(resp.is_none());
+
+        // Mismatch count should not be incremented
+        assert_eq!(task.peer_state(&peer).unwrap().mismatch_count(0), 0);
+    }
+
+    #[test]
+    fn test_handle_digest_out_of_bounds_shard() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Out of bounds shard
+        let resp = task.handle_digest_exchange(peer, 100, 0, 0xDEAD);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn test_handle_snapshot_request() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let task = AntiEntropyTask::new(db, config);
+
+        let response = task.handle_snapshot_request(0);
+        assert!(response.is_some());
+        match response.unwrap() {
+            Message::Snapshot { shard_id, .. } => assert_eq!(shard_id, 0),
+            _ => panic!("Expected Snapshot"),
+        }
+    }
+
+    #[test]
+    fn test_handle_snapshot_request_out_of_bounds() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let task = AntiEntropyTask::new(db, config);
+
+        // Out of bounds shard
+        let response = task.handle_snapshot_request(100);
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn test_handle_snapshot_applies_data() {
+        use crate::types::Key;
+
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+        task.register_peer(peer);
+
+        // Mark snapshot as pending to verify it gets cleared
+        task.peer_state_mut(&peer).unwrap().mark_snapshot_pending(0);
+        task.peer_state_mut(&peer).unwrap().increment_mismatch(0);
+
+        // Apply a snapshot with some data
+        let entries = vec![
+            (Key::from("key1"), 100),
+            (Key::from("key2"), 200),
+        ];
+        task.handle_snapshot(peer, 0, 50, 0xCAFE, entries);
+
+        // Verify snapshot pending is cleared
+        assert!(!task.peer_state(&peer).unwrap().is_snapshot_pending(0));
+
+        // Verify mismatch count is reset
+        assert_eq!(task.peer_state(&peer).unwrap().mismatch_count(0), 0);
+
+        // Verify head_seq is updated
+        assert_eq!(task.db.shard_head_seq(0), 50);
+    }
+
+    #[test]
+    fn test_handle_snapshot_out_of_bounds_shard() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // Out of bounds shard - should be a no-op
+        task.handle_snapshot(peer, 100, 50, 0xCAFE, vec![]);
+    }
+
+    #[test]
+    fn test_build_digest_messages() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let task = AntiEntropyTask::new(db, config);
+
+        let messages = task.build_digest_messages();
+
+        // Should have one message per shard
+        assert_eq!(messages.len(), 4);
+
+        for (i, msg) in messages.iter().enumerate() {
+            match msg {
+                Message::DigestExchange { shard_id, head_seq, digest } => {
+                    assert_eq!(*shard_id, i as u16);
+                    assert_eq!(*head_seq, 0);
+                    assert_eq!(*digest, 0);
+                }
+                _ => panic!("Expected DigestExchange message"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_digest_messages_with_data() {
+        use crate::types::Key;
+
+        let db = create_test_db();
+        let config = AntiEntropyConfig::default();
+        let task = AntiEntropyTask::new(Arc::clone(&db), config);
+
+        // Add some data to change the digest
+        let key = Key::from("test_key");
+        let (shard_id, _, _) = db.increment(key, 100);
+
+        let messages = task.build_digest_messages();
+
+        // The shard with data should have non-zero head_seq and digest
+        for msg in messages {
+            match msg {
+                Message::DigestExchange { shard_id: sid, head_seq, digest } => {
+                    if sid == shard_id {
+                        assert_eq!(head_seq, 1);
+                        assert_ne!(digest, 0);
+                    }
+                }
+                _ => panic!("Expected DigestExchange message"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_snapshot_pending_prevents_duplicate_request() {
+        let db = create_test_db();
+        let mut config = AntiEntropyConfig::default();
+        config.snapshot_threshold = 1;
+        let mut task = AntiEntropyTask::new(db, config);
+
+        let peer: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+
+        // First mismatch - triggers snapshot request
+        let resp1 = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        assert!(resp1.is_some());
+
+        // Second mismatch - should NOT trigger another request (pending)
+        let resp2 = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
+        assert!(resp2.is_none());
     }
 }
