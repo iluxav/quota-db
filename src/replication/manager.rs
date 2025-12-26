@@ -1,5 +1,5 @@
 use crate::engine::ShardedDb;
-use crate::replication::{Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerState};
+use crate::replication::{AntiEntropyConfig, AntiEntropyTask, Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerState};
 use crate::types::NodeId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -73,6 +73,10 @@ pub struct ReplicationManager {
     db: Option<Arc<ShardedDb>>,
     /// Number of nodes in cluster for allocator assignment
     num_nodes: usize,
+    /// Anti-entropy task
+    anti_entropy: Option<AntiEntropyTask>,
+    /// Anti-entropy configuration
+    anti_entropy_config: AntiEntropyConfig,
 }
 
 impl ReplicationManager {
@@ -93,6 +97,8 @@ impl ReplicationManager {
             writers: HashMap::new(),
             db: None,
             num_nodes,
+            anti_entropy: None,
+            anti_entropy_config: AntiEntropyConfig::default(),
         };
 
         let handle = ReplicationHandle { tx };
@@ -102,6 +108,17 @@ impl ReplicationManager {
     /// Set the database reference for quota operations
     pub fn set_db(&mut self, db: Arc<ShardedDb>) {
         self.db = Some(db);
+    }
+
+    /// Initialize anti-entropy with the database reference
+    pub fn init_anti_entropy(&mut self) {
+        if let Some(ref db) = self.db {
+            self.anti_entropy = Some(AntiEntropyTask::new(
+                db.clone(),
+                self.anti_entropy_config.clone(),
+            ));
+            info!("Anti-entropy initialized");
+        }
     }
 
     /// Check if this node is the allocator for a given shard
@@ -164,6 +181,12 @@ impl ReplicationManager {
         // Main loop
         let mut flush_interval = interval(self.config.batch_max_delay);
 
+        // Anti-entropy interval
+        let ae_interval = self.anti_entropy.as_ref()
+            .map(|ae| ae.status_interval())
+            .unwrap_or(Duration::from_secs(5));
+        let mut anti_entropy_interval = interval(ae_interval);
+
         loop {
             tokio::select! {
                 // Receive deltas from shards
@@ -191,6 +214,11 @@ impl ReplicationManager {
                         // Store writer for sending deltas
                         self.writers.insert(addr, writer);
 
+                        // Register peer for anti-entropy tracking
+                        if let Some(ref mut ae) = self.anti_entropy {
+                            ae.register_peer(addr);
+                        }
+
                         // Spawn reader task
                         let msg_tx = msg_tx.clone();
                         let apply_delta = apply_delta.clone();
@@ -205,11 +233,14 @@ impl ReplicationManager {
 
                 // Receive messages from peers
                 Some((addr, msg)) = msg_rx.recv() => {
-                    if let Some(response) = self.handle_peer_message(addr, msg) {
-                        // Send response back to the peer
+                    let responses = self.handle_peer_message(addr, msg);
+                    if !responses.is_empty() {
                         if let Some(writer) = self.writers.get_mut(&addr) {
-                            if let Err(e) = writer.send(&response).await {
-                                error!("Failed to send quota response to {}: {}", addr, e);
+                            for resp in responses {
+                                if let Err(e) = writer.send(&resp).await {
+                                    error!("Failed to send response to {}: {}", addr, e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -220,10 +251,44 @@ impl ReplicationManager {
                     self.flush_all_peers().await;
                 }
 
+                // Anti-entropy cycle
+                _ = anti_entropy_interval.tick() => {
+                    if let Some(ref mut ae) = self.anti_entropy {
+                        ae.increment_cycle();
+
+                        // Build and broadcast status to all connected peers
+                        let status_msg = ae.build_status_message();
+                        for (addr, writer) in &mut self.writers {
+                            if let Err(e) = writer.send(&status_msg).await {
+                                warn!("Failed to send status to {}: {}", addr, e);
+                            }
+                        }
+
+                        // If digest cycle, also send digests
+                        if ae.should_check_digest() {
+                            let digest_msgs = ae.build_digest_messages();
+                            for (addr, writer) in &mut self.writers {
+                                for msg in &digest_msgs {
+                                    if let Err(e) = writer.send(msg).await {
+                                        warn!("Failed to send digest to {}: {}", addr, e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Handle disconnections
                 Some(addr) = disconnect_rx.recv() => {
                     info!("Peer {} disconnected, removing writer", addr);
                     self.writers.remove(&addr);
+
+                    // Unregister peer from anti-entropy tracking
+                    if let Some(ref mut ae) = self.anti_entropy {
+                        ae.unregister_peer(addr);
+                    }
+
                     if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                         peer.state = crate::replication::ConnectionState::Disconnected;
                         peer.increase_backoff();
@@ -252,26 +317,26 @@ impl ReplicationManager {
     }
 
     /// Handle a message from a peer
-    /// Returns an optional response message to send back
-    fn handle_peer_message(&mut self, addr: SocketAddr, msg: Message) -> Option<Message> {
+    /// Returns response messages to send back
+    fn handle_peer_message(&mut self, addr: SocketAddr, msg: Message) -> Vec<Message> {
         match msg {
             Message::Ack { shard_id, acked_seq } => {
                 if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                     peer.update_acked(shard_id, acked_seq);
                     debug!("Peer {} acked shard {} seq {}", addr, shard_id, acked_seq);
                 }
-                None
+                vec![]
             }
             Message::Hello { node_id } => {
                 if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                     peer.node_id = Some(node_id);
                     info!("Peer {} identified as node {}", addr, node_id.as_u32());
                 }
-                None
+                vec![]
             }
             Message::DeltaBatch { .. } => {
                 // Inbound deltas are handled by the reader task directly
-                None
+                vec![]
             }
             Message::QuotaRequest { shard_id, key, requested } => {
                 // Handle token request from a remote node
@@ -294,14 +359,14 @@ impl ReplicationManager {
 
                         if granted > 0 {
                             debug!("Granting {} tokens for {:?} to node {}", granted, key, from_node.as_u32());
-                            return Some(Message::quota_grant(shard_id, key, granted));
+                            return vec![Message::quota_grant(shard_id, key, granted)];
                         } else {
                             debug!("Denying token request for {:?} to node {}", key, from_node.as_u32());
-                            return Some(Message::quota_deny(shard_id, key));
+                            return vec![Message::quota_deny(shard_id, key)];
                         }
                     }
                 }
-                None
+                vec![]
             }
             Message::QuotaGrant { shard_id, key, granted } => {
                 // Handle token grant from allocator - add tokens to local quota entry
@@ -314,7 +379,7 @@ impl ReplicationManager {
                     db.quota_add_tokens(&key, granted);
                     info!("Added {} tokens for {:?}", granted, key);
                 }
-                None
+                vec![]
             }
             Message::QuotaDeny { shard_id, key } => {
                 // Handle token denial from allocator
@@ -323,7 +388,7 @@ impl ReplicationManager {
                     addr, key, shard_id
                 );
                 // Request is denied, nothing to do - client already got -1
-                None
+                vec![]
             }
             Message::QuotaSync { shard_id, key, limit, window_secs } => {
                 // Handle quota configuration sync from another node
@@ -339,17 +404,44 @@ impl ReplicationManager {
                         info!("Created quota from sync: limit={}, window={}s", limit, window_secs);
                     }
                 }
-                None
+                vec![]
             }
-            // Anti-entropy messages - will be handled by the anti-entropy subsystem
-            Message::Status { .. } |
-            Message::DeltaRequest { .. } |
-            Message::DigestExchange { .. } |
-            Message::SnapshotRequest { .. } |
-            Message::Snapshot { .. } => {
-                // Anti-entropy messages are handled separately
-                debug!("Received anti-entropy message from {}, ignoring in base handler", addr);
-                None
+            // Anti-entropy messages
+            Message::Status { shard_seqs } => {
+                if let Some(ref mut ae) = self.anti_entropy {
+                    ae.handle_status(addr, shard_seqs)
+                } else {
+                    vec![]
+                }
+            }
+            Message::DeltaRequest { shard_id, from_seq, to_seq } => {
+                debug!("Received DeltaRequest for shard {} from {} to {}", shard_id, from_seq, to_seq);
+                // TODO: Future - fetch from replication log and send
+                vec![]
+            }
+            Message::DigestExchange { shard_id, head_seq, digest } => {
+                if let Some(ref mut ae) = self.anti_entropy {
+                    ae.handle_digest_exchange(addr, shard_id, head_seq, digest)
+                        .map(|m| vec![m])
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            }
+            Message::SnapshotRequest { shard_id } => {
+                if let Some(ref ae) = self.anti_entropy {
+                    ae.handle_snapshot_request(shard_id)
+                        .map(|m| vec![m])
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            }
+            Message::Snapshot { shard_id, head_seq, digest, entries } => {
+                if let Some(ref mut ae) = self.anti_entropy {
+                    ae.handle_snapshot(addr, shard_id, head_seq, digest, entries);
+                }
+                vec![]
             }
         }
     }
