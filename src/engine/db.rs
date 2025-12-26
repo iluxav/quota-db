@@ -189,6 +189,43 @@ impl ShardedDb {
         let idx = self.shard_index(key);
         self.shards[idx].write().quota_add_tokens(key, amount);
     }
+
+    // ========== Anti-Entropy Accessor Methods ==========
+
+    /// Get the replication log head sequence for a shard
+    pub fn shard_head_seq(&self, shard_idx: usize) -> u64 {
+        if shard_idx < self.num_shards {
+            self.shards[shard_idx].read().head_seq()
+        } else {
+            0
+        }
+    }
+
+    /// Get the digest for a shard
+    pub fn shard_digest(&self, shard_idx: usize) -> u64 {
+        if shard_idx < self.num_shards {
+            self.shards[shard_idx].read().digest()
+        } else {
+            0
+        }
+    }
+
+    /// Create a snapshot of a shard
+    /// Returns (head_seq, digest, entries) where entries is a list of (key, value) pairs.
+    pub fn create_shard_snapshot(&self, shard_idx: usize) -> Option<(u64, u64, Vec<(Key, i64)>)> {
+        if shard_idx < self.num_shards {
+            Some(self.shards[shard_idx].read().create_snapshot())
+        } else {
+            None
+        }
+    }
+
+    /// Apply a snapshot to a shard
+    pub fn apply_shard_snapshot(&self, shard_idx: usize, head_seq: u64, entries: Vec<(Key, i64)>) {
+        if shard_idx < self.num_shards {
+            self.shards[shard_idx].write().apply_snapshot(head_seq, entries);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +373,132 @@ mod tests {
         db.apply_delta(shard_idx as u16, &delta);
 
         assert_eq!(db.get(&key), Some(10));
+    }
+
+    // ========== Anti-Entropy Accessor Tests ==========
+
+    #[test]
+    fn test_shard_head_seq() {
+        let db = create_db();
+        let key = Key::from("counter");
+
+        // Initially, head_seq should be 0
+        for i in 0..4 {
+            assert_eq!(db.shard_head_seq(i), 0);
+        }
+
+        // Increment a key (this should increase head_seq for the shard)
+        let (shard_id, _, _) = db.increment(key.clone(), 10);
+        assert_eq!(db.shard_head_seq(shard_id as usize), 1);
+
+        // Another increment on the same key
+        let _ = db.increment(key.clone(), 5);
+        assert_eq!(db.shard_head_seq(shard_id as usize), 2);
+
+        // Out of bounds should return 0
+        assert_eq!(db.shard_head_seq(100), 0);
+    }
+
+    #[test]
+    fn test_shard_digest() {
+        let db = create_db();
+        let key = Key::from("counter");
+
+        // Initially, digest should be 0 for all shards
+        for i in 0..4 {
+            assert_eq!(db.shard_digest(i), 0);
+        }
+
+        // Increment a key (this should change the digest for that shard)
+        let (shard_id, _, _) = db.increment(key.clone(), 10);
+        let digest = db.shard_digest(shard_id as usize);
+        assert_ne!(digest, 0);
+
+        // Out of bounds should return 0
+        assert_eq!(db.shard_digest(100), 0);
+    }
+
+    #[test]
+    fn test_create_shard_snapshot() {
+        let db = create_db();
+        let key1 = Key::from("counter1");
+        let key2 = Key::from("counter2");
+
+        // Add some data
+        let (shard_id1, _, _) = db.increment(key1.clone(), 100);
+        let (shard_id2, _, _) = db.increment(key2.clone(), 200);
+
+        // Create snapshot for the first shard
+        let snapshot = db.create_shard_snapshot(shard_id1 as usize);
+        assert!(snapshot.is_some());
+
+        let (head_seq, digest, entries) = snapshot.unwrap();
+        assert!(head_seq > 0);
+
+        // If both keys ended up in the same shard, entries should have 2 items
+        // Otherwise, entries should have 1 item
+        if shard_id1 == shard_id2 {
+            assert_eq!(entries.len(), 2);
+            assert_ne!(digest, 0);
+        } else {
+            assert_eq!(entries.len(), 1);
+            assert_ne!(digest, 0);
+        }
+
+        // Out of bounds should return None
+        assert!(db.create_shard_snapshot(100).is_none());
+    }
+
+    #[test]
+    fn test_apply_shard_snapshot() {
+        let db1 = create_db();
+        let db2 = create_db();
+
+        let key = Key::from("snapshot_test");
+
+        // Add data to db1
+        let (shard_id, _, _) = db1.increment(key.clone(), 42);
+        let (head_seq, digest1, entries) = db1.create_shard_snapshot(shard_id as usize).unwrap();
+
+        // Apply snapshot to db2
+        db2.apply_shard_snapshot(shard_id as usize, head_seq, entries);
+
+        // Data should now exist in db2
+        assert_eq!(db2.get(&key), Some(42));
+
+        // Digests should match
+        let digest2 = db2.shard_digest(shard_id as usize);
+        assert_eq!(digest1, digest2);
+
+        // Head sequences should match
+        assert_eq!(db2.shard_head_seq(shard_id as usize), head_seq);
+    }
+
+    #[test]
+    fn test_snapshot_round_trip_db_level() {
+        let db1 = create_db();
+
+        // Add multiple keys that will go to different shards
+        let keys: Vec<Key> = (0..20).map(|i| Key::from(format!("key_{}", i))).collect();
+        let mut key_values: Vec<(Key, i64)> = Vec::new();
+
+        for key in &keys {
+            let (_, value, _) = db1.increment(key.clone(), 10);
+            key_values.push((key.clone(), value));
+        }
+
+        // Create snapshots for all shards and apply to a new db
+        let db2 = create_db();
+
+        for shard_idx in 0..4 {
+            if let Some((head_seq, _, entries)) = db1.create_shard_snapshot(shard_idx) {
+                db2.apply_shard_snapshot(shard_idx, head_seq, entries);
+            }
+        }
+
+        // Verify all keys have the same values
+        for (key, expected_value) in key_values {
+            assert_eq!(db2.get(&key), Some(expected_value));
+        }
     }
 }
