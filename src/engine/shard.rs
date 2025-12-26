@@ -189,15 +189,21 @@ impl Shard {
             counter.set_value(self.node_id, value);
 
             // Update digest
-            match old_value {
-                Some(old) if old != 0 => {
-                    self.digest.update(&key, old, value);
+            match (old_value, value) {
+                (Some(old), new) if old != 0 && new != 0 => {
+                    // Both old and new are non-zero: update
+                    self.digest.update(&key, old, new);
+                }
+                (Some(old), 0) if old != 0 => {
+                    // Old was non-zero, new is zero: remove
+                    self.digest.remove(&key, old);
+                }
+                (_, new) if new != 0 => {
+                    // Old was zero or None, new is non-zero: insert
+                    self.digest.insert(&key, new);
                 }
                 _ => {
-                    // Either new key or old value was 0
-                    if value != 0 {
-                        self.digest.insert(&key, value);
-                    }
+                    // Both old and new are 0: no change to digest
                 }
             }
         }
@@ -333,7 +339,11 @@ impl Shard {
             // (it might have been updated with a new TTL)
             if let Some(Entry::Counter(entry)) = self.data.get(&ttl_entry.key) {
                 if entry.is_expired(current_ts) {
+                    let value = entry.value(); // Get value before removing
                     self.data.remove(&ttl_entry.key);
+                    if value != 0 {
+                        self.digest.remove(&ttl_entry.key, value); // Update digest
+                    }
                     expired += 1;
                 }
             }
@@ -772,7 +782,27 @@ mod tests {
         // Set to 0 (effectively "removing" from digest perspective)
         shard.set(key.clone(), 0);
 
-        // Value should be 0 but digest might include the 0 entry
+        // Value should be 0 and digest should be back to 0
         assert_eq!(shard.get(&key), Some(0));
+        assert_eq!(shard.digest(), 0);
+    }
+
+    #[test]
+    fn test_digest_updates_on_expiration() {
+        let mut shard = create_shard();
+        let key = Key::from("expiring");
+
+        shard.increment(key.clone(), 100);
+        let digest_before = shard.digest();
+        assert_ne!(digest_before, 0);
+
+        shard.expire(key.clone(), 1000);
+
+        // Expire the entry
+        let expired = shard.expire_entries(1000);
+        assert_eq!(expired, 1);
+
+        // Digest should be back to 0
+        assert_eq!(shard.digest(), 0);
     }
 }
