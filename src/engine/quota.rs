@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustc_hash::FxHashMap;
 
-use crate::types::NodeId;
+use crate::persistence::{AllocatorSnapshot, QuotaSnapshot};
+use crate::types::{Key, NodeId};
 
 /// Quota entry for rate limiting with token bucket semantics.
 ///
@@ -117,6 +118,27 @@ impl QuotaEntry {
         // 10% of limit, minimum 1
         (self.limit / 10).max(1)
     }
+
+    /// Create a snapshot of this quota entry.
+    pub fn to_snapshot(&self, key: Key) -> QuotaSnapshot {
+        QuotaSnapshot {
+            key,
+            limit: self.limit,
+            window_secs: self.window_secs,
+            local_tokens: self.local_tokens,
+            window_start: self.window_start,
+        }
+    }
+
+    /// Restore from a snapshot.
+    pub fn from_snapshot(snap: &QuotaSnapshot) -> Self {
+        Self {
+            limit: snap.limit,
+            window_secs: snap.window_secs,
+            local_tokens: snap.local_tokens,
+            window_start: snap.window_start,
+        }
+    }
 }
 
 /// Allocator state for a quota key (only on shard owner node).
@@ -197,6 +219,26 @@ impl AllocatorState {
     #[inline]
     pub fn window_start(&self) -> u64 {
         self.window_start
+    }
+
+    /// Create a snapshot of this allocator state.
+    pub fn to_snapshot(&self, key: Key) -> AllocatorSnapshot {
+        AllocatorSnapshot {
+            key,
+            grants: self.grants.iter().map(|(n, v)| (n.as_u32(), *v)).collect(),
+            total_granted: self.total_granted,
+            window_start: self.window_start,
+        }
+    }
+
+    /// Restore from a snapshot.
+    pub fn from_snapshot(snap: &AllocatorSnapshot) -> Self {
+        let mut state = Self::with_window_start(snap.window_start);
+        for &(node_id, count) in &snap.grants {
+            state.grants.insert(NodeId::new(node_id), count);
+        }
+        state.total_granted = snap.total_granted;
+        state
     }
 }
 

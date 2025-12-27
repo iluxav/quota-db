@@ -1,7 +1,8 @@
 use rustc_hash::FxHashMap;
 
 use crate::engine::quota::QuotaEntry;
-use crate::types::NodeId;
+use crate::persistence::CounterSnapshot;
+use crate::types::{Key, NodeId};
 
 /// Entry type in the database - either a PN-Counter or a Quota.
 #[derive(Debug, Clone)]
@@ -211,6 +212,30 @@ impl PnCounterEntry {
     #[inline]
     pub fn is_expired(&self, current_ts: u64) -> bool {
         self.expires_at.map_or(false, |exp| current_ts >= exp)
+    }
+
+    /// Create a snapshot of this counter.
+    pub fn to_snapshot(&self, key: Key) -> CounterSnapshot {
+        CounterSnapshot {
+            key,
+            p_values: self.p.iter().map(|(n, v)| (n.as_u32(), *v)).collect(),
+            n_values: self.n.iter().map(|(n, v)| (n.as_u32(), *v)).collect(),
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// Restore from a snapshot.
+    pub fn from_snapshot(snap: &CounterSnapshot) -> Self {
+        let mut entry = Self::new();
+        for &(node_id, count) in &snap.p_values {
+            entry.p.insert(NodeId::new(node_id), count);
+        }
+        for &(node_id, count) in &snap.n_values {
+            entry.n.insert(NodeId::new(node_id), count);
+        }
+        entry.expires_at = snap.expires_at;
+        entry.recalculate_value();
+        entry
     }
 
     /// Get the number of nodes that have contributed to this counter

@@ -5,6 +5,7 @@ use std::collections::BinaryHeap;
 use crate::engine::entry::Entry;
 use crate::engine::quota::{AllocatorState, QuotaEntry};
 use crate::engine::PnCounterEntry;
+use crate::persistence::ShardSnapshot;
 use crate::replication::{Delta, ReplicationLog, ShardDigest};
 use crate::types::{Key, NodeId};
 
@@ -486,6 +487,88 @@ impl Shard {
 
         self.rep_log.reset_to(head_seq);
     }
+
+    // ========== Persistence Snapshot Methods ==========
+
+    /// Create a full snapshot of this shard for persistence.
+    pub fn create_persistence_snapshot(&self) -> ShardSnapshot {
+        let mut snapshot = ShardSnapshot::new(
+            self.id as u16,
+            self.node_id.as_u32(),
+            self.rep_log.head_seq(),
+            self.digest.value(),
+        );
+
+        // Snapshot all entries
+        for (key, entry) in &self.data {
+            match entry {
+                Entry::Counter(counter) => {
+                    snapshot.counters.push(counter.to_snapshot(key.clone()));
+                }
+                Entry::Quota(quota) => {
+                    snapshot.quotas.push(quota.to_snapshot(key.clone()));
+                }
+            }
+        }
+
+        // Snapshot allocator states
+        for (key, alloc) in &self.allocators {
+            snapshot.allocators.push(alloc.to_snapshot(key.clone()));
+        }
+
+        snapshot
+    }
+
+    /// Restore shard state from a persistence snapshot.
+    pub fn restore_from_snapshot(&mut self, snapshot: ShardSnapshot) {
+        // Clear current state
+        self.data.clear();
+        self.allocators.clear();
+        self.digest = ShardDigest::new();
+
+        // Restore counters
+        for counter_snap in snapshot.counters {
+            let entry = PnCounterEntry::from_snapshot(&counter_snap);
+            let value = entry.value();
+            self.data
+                .insert(counter_snap.key.clone(), Entry::Counter(entry));
+            self.digest.insert(&counter_snap.key, value);
+        }
+
+        // Restore quotas
+        for quota_snap in snapshot.quotas {
+            let entry = QuotaEntry::from_snapshot(&quota_snap);
+            let value = entry.local_tokens();
+            self.data
+                .insert(quota_snap.key.clone(), Entry::Quota(entry));
+            self.digest.insert(&quota_snap.key, value);
+        }
+
+        // Restore allocators
+        for alloc_snap in snapshot.allocators {
+            let state = AllocatorState::from_snapshot(&alloc_snap);
+            self.allocators.insert(alloc_snap.key, state);
+        }
+
+        // Reset replication log to snapshot sequence
+        self.rep_log.reset_to(snapshot.seq);
+    }
+
+    /// Delete a key from the shard.
+    pub fn delete(&mut self, key: &Key) {
+        if let Some(entry) = self.data.remove(key) {
+            let value = match &entry {
+                Entry::Counter(c) => c.value(),
+                Entry::Quota(q) => q.local_tokens(),
+            };
+            self.digest.remove(key, value);
+        }
+    }
+
+    /// Get mutable reference to quota entry.
+    pub fn get_quota_mut(&mut self, key: &Key) -> Option<&mut QuotaEntry> {
+        self.data.get_mut(key).and_then(|e| e.as_quota_mut())
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +887,92 @@ mod tests {
 
         // Digest should be back to 0
         assert_eq!(shard.digest(), 0);
+    }
+
+    #[test]
+    fn test_shard_persistence_snapshot() {
+        let node = NodeId::new(1);
+        let mut shard = Shard::new(0, node);
+
+        // Add some data
+        shard.increment(Key::from("counter1"), 100);
+        shard.increment(Key::from("counter2"), 200);
+        shard.quota_set(Key::from("quota1"), 1000, 60);
+
+        // Create snapshot
+        let snapshot = shard.create_persistence_snapshot();
+        assert_eq!(snapshot.counters.len(), 2);
+        assert_eq!(snapshot.quotas.len(), 1);
+
+        // Create new shard and restore
+        let mut shard2 = Shard::new(0, node);
+        shard2.restore_from_snapshot(snapshot);
+
+        assert_eq!(shard2.get(&Key::from("counter1")), Some(100));
+        assert_eq!(shard2.get(&Key::from("counter2")), Some(200));
+        assert!(shard2.is_quota(&Key::from("quota1")));
+    }
+
+    #[test]
+    fn test_shard_persistence_snapshot_with_allocators() {
+        let node = NodeId::new(1);
+        let mut shard = Shard::new(0, node);
+
+        // Set up a quota and grant some tokens
+        let key = Key::from("rate_limit");
+        shard.quota_set(key.clone(), 10000, 60);
+
+        // Grant tokens from allocator
+        let granted = shard.allocator_grant(&key, node, 500);
+        assert_eq!(granted, 500);
+
+        // Create snapshot
+        let snapshot = shard.create_persistence_snapshot();
+        assert_eq!(snapshot.quotas.len(), 1);
+        assert_eq!(snapshot.allocators.len(), 1);
+        assert_eq!(snapshot.allocators[0].total_granted, 500);
+
+        // Restore to new shard
+        let mut shard2 = Shard::new(0, node);
+        shard2.restore_from_snapshot(snapshot);
+
+        // Quota should be restored
+        assert!(shard2.is_quota(&key));
+        let quota_info = shard2.quota_get(&key).unwrap();
+        assert_eq!(quota_info.0, 10000); // limit
+        assert_eq!(quota_info.1, 60);    // window_secs
+    }
+
+    #[test]
+    fn test_delete_key() {
+        let mut shard = create_shard();
+        let key = Key::from("to_delete");
+
+        shard.increment(key.clone(), 100);
+        assert_eq!(shard.get(&key), Some(100));
+
+        shard.delete(&key);
+        assert_eq!(shard.get(&key), None);
+    }
+
+    #[test]
+    fn test_get_quota_mut() {
+        let node = NodeId::new(1);
+        let mut shard = Shard::new(0, node);
+        let key = Key::from("quota");
+
+        // No quota initially
+        assert!(shard.get_quota_mut(&key).is_none());
+
+        // Add a quota
+        shard.quota_set(key.clone(), 1000, 60);
+
+        // Should be able to get mutable reference
+        let quota = shard.get_quota_mut(&key).unwrap();
+        quota.add_tokens(500);
+
+        // Verify tokens were added
+        let info = shard.quota_get(&key).unwrap();
+        assert_eq!(info.2, 500); // remaining tokens
     }
 }
