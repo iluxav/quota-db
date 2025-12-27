@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use crate::config::Config;
 use crate::engine::shard::QuotaResult;
 use crate::engine::Shard;
+use crate::persistence::{recover_shard, PersistenceConfig};
 use crate::replication::Delta;
 use crate::types::{Key, NodeId};
 
@@ -28,6 +29,39 @@ impl ShardedDb {
         for id in 0..num_shards {
             shards.push(RwLock::new(Shard::new(id, node_id)));
         }
+
+        Self {
+            shards,
+            num_shards,
+            node_id,
+        }
+    }
+
+    /// Create a new ShardedDb with optional recovery from persistence.
+    pub fn with_persistence(config: &Config, persistence: &PersistenceConfig) -> Self {
+        let node_id = config.node_id();
+        let num_shards = config.shards;
+
+        let shards: Vec<_> = if persistence.enabled {
+            (0..num_shards)
+                .map(|i| {
+                    match recover_shard(persistence, i as u16, node_id) {
+                        Ok((shard, seq)) => {
+                            tracing::info!("Shard {} recovered at seq {}", i, seq);
+                            RwLock::new(shard)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Shard {} recovery failed: {}, starting fresh", i, e);
+                            RwLock::new(Shard::new(i, node_id))
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            (0..num_shards)
+                .map(|i| RwLock::new(Shard::new(i, node_id)))
+                .collect()
+        };
 
         Self {
             shards,

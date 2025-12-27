@@ -36,8 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.shards, config.node_id, config.max_connections
     );
 
-    // Create the sharded database
-    let db = Arc::new(ShardedDb::new(&config));
+    // Get persistence config
+    let persistence_config = config.persistence_config();
+
+    // Create the sharded database (with recovery if enabled)
+    let db = if persistence_config.enabled {
+        info!("Persistence enabled, data dir: {:?}", persistence_config.data_dir);
+        Arc::new(ShardedDb::with_persistence(&config, &persistence_config))
+    } else {
+        Arc::new(ShardedDb::new(&config))
+    };
 
     // Start TTL expiration task if enabled
     if config.enable_ttl {
