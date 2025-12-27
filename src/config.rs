@@ -51,6 +51,32 @@ pub struct Config {
     /// Maximum delay in milliseconds before flushing batch to peers
     #[arg(long, default_value = "10")]
     pub batch_max_delay_ms: u64,
+
+    // === Persistence settings ===
+
+    /// Enable persistence (WAL + snapshots)
+    #[arg(long, default_value = "false")]
+    pub persistence: bool,
+
+    /// Data directory for persistence files
+    #[arg(long, default_value = "./data")]
+    pub data_dir: String,
+
+    /// WAL sync interval in milliseconds
+    #[arg(long, default_value = "100")]
+    pub wal_sync_ms: u64,
+
+    /// WAL sync ops threshold
+    #[arg(long, default_value = "1000")]
+    pub wal_sync_ops: usize,
+
+    /// Snapshot interval in seconds
+    #[arg(long, default_value = "300")]
+    pub snapshot_interval_secs: u64,
+
+    /// Snapshot WAL size threshold in MB
+    #[arg(long, default_value = "64")]
+    pub snapshot_wal_mb: u64,
 }
 
 impl Config {
@@ -62,6 +88,21 @@ impl Config {
     /// Get the NodeId for this instance
     pub fn node_id(&self) -> NodeId {
         NodeId::new(self.node_id)
+    }
+
+    /// Get persistence configuration.
+    pub fn persistence_config(&self) -> crate::persistence::PersistenceConfig {
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        crate::persistence::PersistenceConfig {
+            enabled: self.persistence,
+            data_dir: PathBuf::from(&self.data_dir),
+            wal_sync_interval: Duration::from_millis(self.wal_sync_ms),
+            wal_sync_ops: self.wal_sync_ops,
+            snapshot_interval: Duration::from_secs(self.snapshot_interval_secs),
+            snapshot_wal_threshold: self.snapshot_wal_mb * 1024 * 1024,
+        }
     }
 }
 
@@ -79,6 +120,12 @@ impl Default for Config {
             replication_port: 6381,
             batch_max_size: 100,
             batch_max_delay_ms: 10,
+            persistence: false,
+            data_dir: "./data".to_string(),
+            wal_sync_ms: 100,
+            wal_sync_ops: 1000,
+            snapshot_interval_secs: 300,
+            snapshot_wal_mb: 64,
         }
     }
 }
