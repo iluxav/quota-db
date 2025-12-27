@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -187,6 +187,110 @@ impl WalWriter {
     }
 }
 
+/// Reader for WAL file with checksum validation.
+pub struct WalReader {
+    reader: BufReader<File>,
+    shard_id: u16,
+}
+
+impl WalReader {
+    /// Open a WAL file for reading.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read and validate header
+        let header: WalHeader = Self::read_header(&mut reader)?;
+        if !header.is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid WAL header",
+            ));
+        }
+
+        Ok(Self {
+            reader,
+            shard_id: header.shard_id,
+        })
+    }
+
+    fn read_header(reader: &mut BufReader<File>) -> io::Result<WalHeader> {
+        // WalHeader is fixed size when serialized with bincode
+        let mut buf = vec![0u8; 16]; // header size
+        reader.read_exact(&mut buf)?;
+        bincode::deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Get the shard ID from the header.
+    pub fn shard_id(&self) -> u16 {
+        self.shard_id
+    }
+
+    /// Read the next entry, returns None at EOF.
+    /// Validates checksum and returns error on corruption.
+    pub fn read_entry(&mut self) -> io::Result<Option<WalEntry>> {
+        // Read length
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        // Read checksum
+        let mut checksum_buf = [0u8; 4];
+        self.reader.read_exact(&mut checksum_buf)?;
+        let expected_checksum = u32::from_le_bytes(checksum_buf);
+
+        // Read data
+        let mut data = vec![0u8; len];
+        self.reader.read_exact(&mut data)?;
+
+        // Validate checksum
+        let mut hasher = Hasher::new();
+        hasher.update(&data);
+        let actual_checksum = hasher.finalize();
+
+        if actual_checksum != expected_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL checksum mismatch: expected {}, got {}",
+                    expected_checksum, actual_checksum
+                ),
+            ));
+        }
+
+        // Deserialize entry
+        let entry: WalEntry = bincode::deserialize(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(Some(entry))
+    }
+
+    /// Read all entries from the WAL.
+    pub fn read_all(&mut self) -> io::Result<Vec<WalEntry>> {
+        let mut entries = Vec::new();
+        while let Some(entry) = self.read_entry()? {
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Read entries with sequence > after_seq.
+    pub fn read_after(&mut self, after_seq: u64) -> io::Result<Vec<WalEntry>> {
+        let mut entries = Vec::new();
+        while let Some(entry) = self.read_entry()? {
+            if entry.seq > after_seq {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +385,82 @@ mod tests {
         let bytes = writer.append(&entry).unwrap();
         assert!(bytes > 0);
         writer.sync().unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_wal_roundtrip() {
+        let dir = std::env::temp_dir().join("quota-db-test-wal-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("wal.bin");
+
+        // Write entries
+        {
+            let mut writer = WalWriter::open(&path, 5, 1000).unwrap();
+            for i in 1..=10 {
+                let entry = WalEntry {
+                    seq: i,
+                    timestamp: i * 1000,
+                    op: WalOp::Incr {
+                        key: Key::from(format!("key{}", i)),
+                        node_id: 1,
+                        delta: i,
+                    },
+                };
+                writer.append(&entry).unwrap();
+            }
+            writer.sync().unwrap();
+        }
+
+        // Read entries
+        {
+            let mut reader = WalReader::open(&path).unwrap();
+            assert_eq!(reader.shard_id(), 5);
+
+            let entries = reader.read_all().unwrap();
+            assert_eq!(entries.len(), 10);
+
+            for (i, entry) in entries.iter().enumerate() {
+                assert_eq!(entry.seq, (i + 1) as u64);
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_wal_read_after() {
+        let dir = std::env::temp_dir().join("quota-db-test-wal-read-after");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("wal.bin");
+
+        // Write entries
+        {
+            let mut writer = WalWriter::open(&path, 0, 1000).unwrap();
+            for i in 1..=10 {
+                let entry = WalEntry {
+                    seq: i,
+                    timestamp: 0,
+                    op: WalOp::Set { key: Key::from("k"), value: i as i64 },
+                };
+                writer.append(&entry).unwrap();
+            }
+            writer.sync().unwrap();
+        }
+
+        // Read entries after seq 5
+        {
+            let mut reader = WalReader::open(&path).unwrap();
+            let entries = reader.read_after(5).unwrap();
+            assert_eq!(entries.len(), 5);
+            assert_eq!(entries[0].seq, 6);
+            assert_eq!(entries[4].seq, 10);
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
