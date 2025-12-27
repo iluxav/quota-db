@@ -3,6 +3,7 @@ pub mod engine;
 pub mod error;
 pub mod metrics;
 pub mod persistence;
+pub mod pool;
 pub mod protocol;
 pub mod replication;
 pub mod server;

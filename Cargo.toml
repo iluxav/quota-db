@@ -21,6 +21,9 @@ rustc-hash = "2.1"
 # Synchronization primitives (faster than std)
 parking_lot = "0.12"
 
+# Lock-free data structures for memory pooling
+crossbeam = "0.8"
+
 # Small vector optimization for command arrays
 smallvec = { version = "1.13", features = ["union", "const_generics"] }
 

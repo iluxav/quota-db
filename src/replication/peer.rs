@@ -1,3 +1,4 @@
+use crate::pool::buffer_pool;
 use crate::replication::{Delta, FrameDecoder, Message};
 use crate::types::NodeId;
 use bytes::BytesMut;
@@ -148,7 +149,7 @@ impl PeerConnection {
         Ok(Self {
             stream,
             decoder: FrameDecoder::new(),
-            write_buf: BytesMut::with_capacity(8192),
+            write_buf: buffer_pool().get_with_capacity(8192),
         })
     }
 
@@ -158,7 +159,7 @@ impl PeerConnection {
         Ok(Self {
             stream,
             decoder: FrameDecoder::new(),
-            write_buf: BytesMut::with_capacity(8192),
+            write_buf: buffer_pool().get_with_capacity(8192),
         })
     }
 
@@ -227,9 +228,16 @@ impl PeerConnection {
         self.stream.peer_addr()
     }
 
-    /// Split into read and write halves for concurrent operations
+    /// Split into read and write halves for concurrent operations.
+    /// Note: The write buffer is transferred to PeerConnectionWriter,
+    /// which handles returning it to the pool on drop.
     pub fn split(self) -> (PeerConnectionReader, PeerConnectionWriter) {
         let (read_half, write_half) = self.stream.into_split();
+
+        // Prevent Drop from running on self by using ManuallyDrop semantics
+        // Actually, split() consumes self, so Drop won't run - the buffer
+        // is moved to PeerConnectionWriter which has its own Drop impl.
+
         (
             PeerConnectionReader {
                 stream: read_half,
@@ -242,6 +250,11 @@ impl PeerConnection {
         )
     }
 }
+
+// Note: PeerConnection does NOT implement Drop because:
+// 1. If split() is called, self is consumed and buffer goes to PeerConnectionWriter
+// 2. If not split, the buffer is just dropped normally (it's small overhead)
+// PeerConnectionWriter has the Drop impl since it's the final owner after split.
 
 /// Read half of a peer connection
 pub struct PeerConnectionReader {
@@ -283,6 +296,13 @@ impl PeerConnectionWriter {
         msg.encode(&mut self.write_buf);
         self.stream.write_all(&self.write_buf).await?;
         Ok(())
+    }
+}
+
+impl Drop for PeerConnectionWriter {
+    fn drop(&mut self) {
+        // Return buffer to pool for reuse
+        buffer_pool().put(std::mem::take(&mut self.write_buf));
     }
 }
 

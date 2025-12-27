@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use parking_lot::RwLock;
 
+use crate::pool::buffer_pool;
+
 /// Global metrics instance for the server.
 pub static METRICS: Metrics = Metrics::new();
 
@@ -281,6 +283,11 @@ impl Metrics {
 
             replication_rtt: self.replication_rtt.percentiles(),
             replication_lag: self.get_replication_lag(),
+
+            // Buffer pool stats
+            pool_size: buffer_pool().len(),
+            pool_hits: buffer_pool().stats().hits,
+            pool_misses: buffer_pool().stats().misses,
         }
     }
 }
@@ -347,6 +354,11 @@ pub struct MetricsSnapshot {
 
     pub replication_rtt: LatencyPercentiles,
     pub replication_lag: ReplicationLagMetrics,
+
+    // Buffer pool stats
+    pub pool_size: usize,
+    pub pool_hits: usize,
+    pub pool_misses: usize,
 }
 
 impl MetricsSnapshot {
@@ -488,6 +500,20 @@ impl MetricsSnapshot {
                 self.snapshots_created
             ));
             out.push_str(&format!("wal_dropped:{}\r\n", self.wal_dropped));
+            out.push_str("\r\n");
+        }
+
+        if include_all || section.eq_ignore_ascii_case("memory") {
+            out.push_str("# Memory\r\n");
+            out.push_str(&format!("buffer_pool_size:{}\r\n", self.pool_size));
+            out.push_str(&format!("buffer_pool_hits:{}\r\n", self.pool_hits));
+            out.push_str(&format!("buffer_pool_misses:{}\r\n", self.pool_misses));
+            let hit_rate = if self.pool_hits + self.pool_misses > 0 {
+                (self.pool_hits as f64 / (self.pool_hits + self.pool_misses) as f64) * 100.0
+            } else {
+                0.0
+            };
+            out.push_str(&format!("buffer_pool_hit_rate:{:.1}\r\n", hit_rate));
             out.push_str("\r\n");
         }
 

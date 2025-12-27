@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
+use crate::pool::buffer_pool;
 use crate::protocol::{Encoder, Frame, Parser};
 
 /// Buffer size for reading from the socket
@@ -27,14 +28,21 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Create a new Connection wrapping a TcpStream
+    /// Create a new Connection wrapping a TcpStream.
+    /// Uses pooled buffers to reduce allocation overhead.
     pub fn new(stream: TcpStream) -> Self {
         // Disable Nagle's algorithm for lower latency
         let _ = stream.set_nodelay(true);
+
+        // Get buffers from pool (reduces per-connection allocations)
+        let pool = buffer_pool();
+        let read_buffer = pool.get_with_capacity(READ_BUFFER_SIZE);
+        let write_buffer = pool.get_with_capacity(WRITE_BUFFER_SIZE);
+
         Self {
             stream: BufWriter::with_capacity(WRITE_BUFFER_SIZE, stream),
-            read_buffer: BytesMut::with_capacity(READ_BUFFER_SIZE),
-            write_buffer: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
+            read_buffer,
+            write_buffer,
             parser: Parser::new(),
             encoder: Encoder::new(),
         }
@@ -120,5 +128,14 @@ impl Connection {
                 "flush timeout: slow client",
             )),
         }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Return buffers to pool for reuse
+        let pool = buffer_pool();
+        pool.put(std::mem::take(&mut self.read_buffer));
+        pool.put(std::mem::take(&mut self.write_buffer));
     }
 }
