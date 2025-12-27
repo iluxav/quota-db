@@ -1,9 +1,11 @@
+mod async_wal;
 mod config;
 mod manager;
 mod recovery;
 mod snapshot;
 mod wal;
 
+pub use async_wal::AsyncWalWriter;
 pub use config::PersistenceConfig;
 pub use manager::{PersistenceHandle, PersistenceManager, WalMessage};
 pub use recovery::recover_shard;

@@ -1,15 +1,14 @@
-//! PersistenceManager - orchestrates WAL writers and snapshots.
+//! PersistenceManager - orchestrates async WAL writers and snapshots.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::metrics::METRICS;
 use crate::persistence::{
-    write_snapshot, PersistenceConfig, ShardSnapshot, WalEntry, WalOp, WalWriter,
+    write_snapshot, AsyncWalWriter, PersistenceConfig, ShardSnapshot, WalEntry, WalOp,
 };
 use crate::types::Key;
 
@@ -122,38 +121,27 @@ impl PersistenceHandle {
     }
 }
 
-/// Manages per-shard WAL writers and snapshot creation.
+/// Manages per-shard async WAL writers and snapshot creation.
 pub struct PersistenceManager {
     config: Arc<PersistenceConfig>,
-    writers: Vec<RwLock<Option<WalWriter>>>,
+    writers: Vec<Mutex<Option<AsyncWalWriter>>>,
     rx: mpsc::Receiver<WalMessage>,
     last_sync: Vec<Instant>,
     last_snapshot: Instant,
+    num_shards: usize,
 }
 
 impl PersistenceManager {
     /// Create a new persistence manager.
+    /// Writers are initialized lazily on first run.
     pub fn new(config: PersistenceConfig, num_shards: usize) -> (Self, PersistenceHandle) {
         let channel_size = config.wal_channel_size;
         let config = Arc::new(config);
         let (tx, rx) = mpsc::channel(channel_size);
 
-        // Initialize per-shard writers
+        // Initialize empty writer slots (will be opened async in run())
         let writers: Vec<_> = (0..num_shards)
-            .map(|i| {
-                if config.enabled {
-                    let path = config.wal_path(i as u16);
-                    match WalWriter::open(&path, i as u16, config.wal_sync_ops) {
-                        Ok(writer) => RwLock::new(Some(writer)),
-                        Err(e) => {
-                            warn!("Failed to open WAL for shard {}: {}", i, e);
-                            RwLock::new(None)
-                        }
-                    }
-                } else {
-                    RwLock::new(None)
-                }
-            })
+            .map(|_| Mutex::new(None))
             .collect();
 
         let last_sync: Vec<_> = (0..num_shards).map(|_| Instant::now()).collect();
@@ -169,12 +157,29 @@ impl PersistenceManager {
             rx,
             last_sync,
             last_snapshot: Instant::now(),
+            num_shards,
         };
 
         (manager, handle)
     }
 
-    /// Run the persistence manager loop.
+    /// Initialize async WAL writers for all shards.
+    async fn init_writers(&self) {
+        for i in 0..self.num_shards {
+            let path = self.config.wal_path(i as u16);
+            match AsyncWalWriter::open(&path, i as u16, self.config.wal_sync_ops).await {
+                Ok(writer) => {
+                    let mut guard = self.writers[i].lock().await;
+                    *guard = Some(writer);
+                }
+                Err(e) => {
+                    warn!("Failed to open async WAL for shard {}: {}", i, e);
+                }
+            }
+        }
+    }
+
+    /// Run the persistence manager loop with async I/O.
     pub async fn run<F>(&mut self, mut get_shard_snapshot: F)
     where
         F: FnMut(u16) -> Option<ShardSnapshot>,
@@ -184,7 +189,9 @@ impl PersistenceManager {
             return;
         }
 
-        info!("Persistence manager started");
+        // Initialize writers asynchronously
+        self.init_writers().await;
+        info!("Persistence manager started with async I/O");
 
         let mut sync_interval = tokio::time::interval(self.config.wal_sync_interval);
         let mut snapshot_check = tokio::time::interval(Duration::from_secs(10));
@@ -193,32 +200,32 @@ impl PersistenceManager {
             tokio::select! {
                 // Process incoming WAL messages
                 Some(msg) = self.rx.recv() => {
-                    self.handle_wal_message(msg);
+                    self.handle_wal_message(msg).await;
                 }
 
                 // Periodic sync check
                 _ = sync_interval.tick() => {
-                    self.sync_all_writers();
+                    self.sync_all_writers().await;
                 }
 
                 // Periodic snapshot check
                 _ = snapshot_check.tick() => {
-                    self.check_snapshot_trigger(&mut get_shard_snapshot);
+                    self.check_snapshot_trigger(&mut get_shard_snapshot).await;
                 }
             }
         }
     }
 
-    fn handle_wal_message(&mut self, msg: WalMessage) {
+    async fn handle_wal_message(&mut self, msg: WalMessage) {
         let shard_id = msg.shard_id as usize;
         if shard_id >= self.writers.len() {
             warn!("Invalid shard_id {} in WAL message", shard_id);
             return;
         }
 
-        let mut writer_guard = self.writers[shard_id].write();
+        let mut writer_guard = self.writers[shard_id].lock().await;
         if let Some(ref mut writer) = *writer_guard {
-            if let Err(e) = writer.append(&msg.entry) {
+            if let Err(e) = writer.append(&msg.entry).await {
                 warn!("Failed to append WAL entry for shard {}: {}", shard_id, e);
             } else {
                 debug!(
@@ -228,7 +235,7 @@ impl PersistenceManager {
 
                 // Check if we should sync based on ops threshold
                 if writer.should_sync(self.config.wal_sync_interval) {
-                    if let Err(e) = writer.sync() {
+                    if let Err(e) = writer.sync().await {
                         METRICS.inc(&METRICS.wal_sync_failures);
                         if writer.is_degraded() {
                             warn!(
@@ -246,12 +253,12 @@ impl PersistenceManager {
         }
     }
 
-    fn sync_all_writers(&mut self) {
-        for (shard_id, writer_lock) in self.writers.iter().enumerate() {
-            let mut writer_guard = writer_lock.write();
-            if let Some(ref mut writer) = *writer_guard {
-                if self.last_sync[shard_id].elapsed() >= self.config.wal_sync_interval {
-                    if let Err(e) = writer.sync() {
+    async fn sync_all_writers(&mut self) {
+        for shard_id in 0..self.writers.len() {
+            if self.last_sync[shard_id].elapsed() >= self.config.wal_sync_interval {
+                let mut writer_guard = self.writers[shard_id].lock().await;
+                if let Some(ref mut writer) = *writer_guard {
+                    if let Err(e) = writer.sync().await {
                         METRICS.inc(&METRICS.wal_sync_failures);
                         if writer.is_degraded() {
                             warn!(
@@ -269,7 +276,7 @@ impl PersistenceManager {
         }
     }
 
-    fn check_snapshot_trigger<F>(&mut self, get_shard_snapshot: &mut F)
+    async fn check_snapshot_trigger<F>(&mut self, get_shard_snapshot: &mut F)
     where
         F: FnMut(u16) -> Option<ShardSnapshot>,
     {
@@ -277,17 +284,18 @@ impl PersistenceManager {
         let time_trigger = self.last_snapshot.elapsed() >= self.config.snapshot_interval;
 
         // Check size-based trigger (any shard exceeds threshold)
-        let size_trigger = self.writers.iter().any(|w| {
-            let guard = w.read();
+        let mut size_trigger = false;
+        for i in 0..self.writers.len() {
+            let guard = self.writers[i].lock().await;
             if let Some(ref writer) = *guard {
-                writer
-                    .file_size()
-                    .map(|s| s >= self.config.snapshot_wal_threshold)
-                    .unwrap_or(false)
-            } else {
-                false
+                if let Ok(size) = writer.file_size().await {
+                    if size >= self.config.snapshot_wal_threshold {
+                        size_trigger = true;
+                        break;
+                    }
+                }
             }
-        });
+        }
 
         if time_trigger || size_trigger {
             info!(
@@ -322,12 +330,12 @@ impl PersistenceManager {
     }
 
     /// Sync all writers and shutdown.
-    pub fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
         info!("Persistence manager shutting down");
-        for (shard_id, writer_lock) in self.writers.iter().enumerate() {
-            let mut writer_guard = writer_lock.write();
+        for shard_id in 0..self.writers.len() {
+            let mut writer_guard = self.writers[shard_id].lock().await;
             if let Some(ref mut writer) = *writer_guard {
-                if let Err(e) = writer.sync() {
+                if let Err(e) = writer.sync().await {
                     warn!("Failed to sync WAL for shard {} on shutdown: {}", shard_id, e);
                 }
             }
