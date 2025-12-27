@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use crate::config::Config;
 use crate::engine::shard::QuotaResult;
 use crate::engine::Shard;
-use crate::persistence::{recover_shard, PersistenceConfig};
+use crate::persistence::{recover_shard, PersistenceConfig, PersistenceHandle};
 use crate::replication::Delta;
 use crate::types::{Key, NodeId};
 
@@ -17,6 +17,8 @@ pub struct ShardedDb {
     shards: Vec<RwLock<Shard>>,
     num_shards: usize,
     node_id: NodeId,
+    /// Optional persistence handle for WAL logging
+    persistence: Option<PersistenceHandle>,
 }
 
 impl ShardedDb {
@@ -34,18 +36,23 @@ impl ShardedDb {
             shards,
             num_shards,
             node_id,
+            persistence: None,
         }
     }
 
     /// Create a new ShardedDb with optional recovery from persistence.
-    pub fn with_persistence(config: &Config, persistence: &PersistenceConfig) -> Self {
+    pub fn with_persistence(
+        config: &Config,
+        persistence_config: &PersistenceConfig,
+        persistence_handle: Option<PersistenceHandle>,
+    ) -> Self {
         let node_id = config.node_id();
         let num_shards = config.shards;
 
-        let shards: Vec<_> = if persistence.enabled {
+        let shards: Vec<_> = if persistence_config.enabled {
             (0..num_shards)
                 .map(|i| {
-                    match recover_shard(persistence, i as u16, node_id) {
+                    match recover_shard(persistence_config, i as u16, node_id) {
                         Ok((shard, seq)) => {
                             tracing::info!("Shard {} recovered at seq {}", i, seq);
                             RwLock::new(shard)
@@ -67,6 +74,7 @@ impl ShardedDb {
             shards,
             num_shards,
             node_id,
+            persistence: persistence_handle,
         }
     }
 
@@ -92,16 +100,30 @@ impl ShardedDb {
     #[inline]
     pub fn increment(&self, key: Key, delta: u64) -> (u16, i64, Delta) {
         let idx = self.shard_index(&key);
-        let (value, rep_delta) = self.shards[idx].write().increment(key, delta);
-        (idx as u16, value, rep_delta)
+        let (value, rep_delta) = self.shards[idx].write().increment(key.clone(), delta);
+        let shard_id = idx as u16;
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            handle.log_incr(shard_id, rep_delta.seq, &key, self.node_id.as_u32(), delta);
+        }
+
+        (shard_id, value, rep_delta)
     }
 
     /// Decrement a key by delta, returning (shard_id, new_value, replication_delta).
     #[inline]
     pub fn decrement(&self, key: Key, delta: u64) -> (u16, i64, Delta) {
         let idx = self.shard_index(&key);
-        let (value, rep_delta) = self.shards[idx].write().decrement(key, delta);
-        (idx as u16, value, rep_delta)
+        let (value, rep_delta) = self.shards[idx].write().decrement(key.clone(), delta);
+        let shard_id = idx as u16;
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            handle.log_decr(shard_id, rep_delta.seq, &key, self.node_id.as_u32(), delta);
+        }
+
+        (shard_id, value, rep_delta)
     }
 
     /// Apply a remote delta from replication.
@@ -121,7 +143,13 @@ impl ShardedDb {
     /// Set a key to a specific value.
     pub fn set(&self, key: Key, value: i64) {
         let idx = self.shard_index(&key);
-        self.shards[idx].write().set(key, value);
+        let shard_id = idx as u16;
+        let seq = self.shards[idx].write().set(key.clone(), value);
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            handle.log_set(shard_id, seq, &key, value);
+        }
     }
 
     // ========== Quota Operations ==========
@@ -129,7 +157,13 @@ impl ShardedDb {
     /// Set up a quota for a key.
     pub fn quota_set(&self, key: Key, limit: u64, window_secs: u64) {
         let idx = self.shard_index(&key);
-        self.shards[idx].write().quota_set(key, limit, window_secs);
+        let shard_id = idx as u16;
+        let seq = self.shards[idx].write().quota_set(key.clone(), limit, window_secs);
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            handle.log_quota_set(shard_id, seq, &key, limit, window_secs);
+        }
     }
 
     /// Get quota info for a key: (limit, window_secs, remaining).
@@ -154,6 +188,7 @@ impl ShardedDb {
     /// For single-node operation, this also acts as the allocator.
     pub fn quota_consume(&self, key: &Key, amount: u64) -> QuotaResult {
         let idx = self.shard_index(key);
+        let shard_id = idx as u16;
         let mut shard = self.shards[idx].write();
 
         // First try local consumption
@@ -164,7 +199,12 @@ impl ShardedDb {
                 // In single-node mode, we are the allocator
                 // Request tokens from ourselves
                 let batch_size = shard.quota_batch_size(key);
-                let granted = shard.allocator_grant(key, self.node_id, batch_size);
+                let (granted, seq_opt) = shard.allocator_grant(key, self.node_id, batch_size);
+
+                // Log grant to WAL if persistence is enabled and tokens were granted
+                if let (Some(ref handle), Some(seq)) = (&self.persistence, seq_opt) {
+                    handle.log_quota_grant(shard_id, seq, key, self.node_id.as_u32(), granted);
+                }
 
                 if granted > 0 {
                     // Add tokens to local balance
@@ -215,7 +255,15 @@ impl ShardedDb {
     /// Returns the number of tokens granted.
     pub fn allocator_grant(&self, key: &Key, to_node: NodeId, requested: u64) -> u64 {
         let idx = self.shard_index(key);
-        self.shards[idx].write().allocator_grant(key, to_node, requested)
+        let shard_id = idx as u16;
+        let (granted, seq_opt) = self.shards[idx].write().allocator_grant(key, to_node, requested);
+
+        // Log to WAL if persistence is enabled and tokens were granted
+        if let (Some(ref handle), Some(seq)) = (&self.persistence, seq_opt) {
+            handle.log_quota_grant(shard_id, seq, key, to_node.as_u32(), granted);
+        }
+
+        granted
     }
 
     /// Add tokens to local quota balance (received from remote allocator).
@@ -258,6 +306,16 @@ impl ShardedDb {
     pub fn apply_shard_snapshot(&self, shard_idx: usize, head_seq: u64, entries: Vec<(Key, i64)>) {
         if shard_idx < self.num_shards {
             self.shards[shard_idx].write().apply_snapshot(head_seq, entries);
+        }
+    }
+
+    /// Create a persistence snapshot for a shard (for WAL/snapshot persistence).
+    pub fn create_persistence_snapshot(&self, shard_id: u16) -> Option<crate::persistence::ShardSnapshot> {
+        let shard_idx = shard_id as usize;
+        if shard_idx < self.num_shards {
+            Some(self.shards[shard_idx].read().create_persistence_snapshot())
+        } else {
+            None
         }
     }
 }

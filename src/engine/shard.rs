@@ -173,8 +173,10 @@ impl Shard {
         })
     }
 
-    /// Set a key to a specific value (only works for counters)
-    pub fn set(&mut self, key: Key, value: i64) {
+    /// Set a key to a specific value. Returns the sequence number of this operation.
+    pub fn set(&mut self, key: Key, value: i64) -> u64 {
+        let seq = self.rep_log.next_seq();
+
         // Get old value before modifying
         let old_value = self.data.get(&key).and_then(|e| match e {
             Entry::Counter(c) => Some(c.value()),
@@ -208,6 +210,8 @@ impl Shard {
                 }
             }
         }
+
+        seq
     }
 
     /// Check if a key is a quota entry
@@ -220,13 +224,17 @@ impl Shard {
 
     /// Set up a quota for a key.
     /// Creates or updates the quota configuration.
-    pub fn quota_set(&mut self, key: Key, limit: u64, window_secs: u64) {
+    /// Returns the sequence number of this operation.
+    pub fn quota_set(&mut self, key: Key, limit: u64, window_secs: u64) -> u64 {
+        let seq = self.rep_log.next_seq();
+
         let quota = QuotaEntry::new(limit, window_secs);
         self.data.insert(key.clone(), Entry::Quota(quota));
 
         // Initialize allocator state for this quota
-        self.allocators
-            .insert(key, AllocatorState::new());
+        self.allocators.insert(key, AllocatorState::new());
+
+        seq
     }
 
     /// Get quota info for a key: (limit, window_secs, remaining)
@@ -284,13 +292,13 @@ impl Shard {
         }
     }
 
-    /// Try to grant tokens from the allocator.
-    /// Returns the number of tokens actually granted.
-    pub fn allocator_grant(&mut self, key: &Key, node: NodeId, requested: u64) -> u64 {
+    /// Grant tokens from allocator to a node.
+    /// Returns (granted_tokens, seq) - seq is only set if tokens were granted.
+    pub fn allocator_grant(&mut self, key: &Key, node: NodeId, requested: u64) -> (u64, Option<u64>) {
         // Get the limit from the quota entry
         let limit = match self.data.get(key) {
             Some(Entry::Quota(q)) => q.limit(),
-            _ => return 0,
+            _ => return (0, None),
         };
 
         // Get or create allocator state
@@ -303,7 +311,13 @@ impl Shard {
             }
         }
 
-        alloc.try_grant(node, requested, limit)
+        let granted = alloc.try_grant(node, requested, limit);
+        if granted > 0 {
+            let seq = self.rep_log.next_seq();
+            (granted, Some(seq))
+        } else {
+            (granted, None)
+        }
     }
 
     /// Get the batch size for token requests for a quota key.
@@ -696,12 +710,13 @@ mod tests {
         let mut shard = create_shard();
         let key = Key::from("counter");
 
+        // Seq numbers start at 1
         let (_, delta) = shard.increment(key.clone(), 10);
-        assert_eq!(delta.seq, 0);
+        assert_eq!(delta.seq, 1);
         assert_eq!(delta.delta_p, 10);
 
         let (_, delta) = shard.decrement(key.clone(), 3);
-        assert_eq!(delta.seq, 1);
+        assert_eq!(delta.seq, 2);
         assert_eq!(delta.delta_n, 3);
 
         assert_eq!(shard.replication_log().head_seq(), 2);
@@ -920,11 +935,12 @@ mod tests {
 
         // Set up a quota and grant some tokens
         let key = Key::from("rate_limit");
-        shard.quota_set(key.clone(), 10000, 60);
+        let _ = shard.quota_set(key.clone(), 10000, 60);
 
         // Grant tokens from allocator
-        let granted = shard.allocator_grant(&key, node, 500);
+        let (granted, seq) = shard.allocator_grant(&key, node, 500);
         assert_eq!(granted, 500);
+        assert!(seq.is_some());
 
         // Create snapshot
         let snapshot = shard.create_persistence_snapshot();

@@ -28,31 +28,41 @@ impl ReplicationLog {
     /// Append an increment delta to the log
     #[inline]
     pub fn append_increment(&mut self, key: Key, node_id: NodeId, delta: u64) -> Delta {
+        self.head_seq += 1;
         let seq = self.head_seq;
         let d = Delta::increment(seq, key, node_id, delta);
-        self.append_delta(d.clone());
+        self.store_delta(d.clone());
         d
     }
 
     /// Append a decrement delta to the log
     #[inline]
     pub fn append_decrement(&mut self, key: Key, node_id: NodeId, delta: u64) -> Delta {
+        self.head_seq += 1;
         let seq = self.head_seq;
         let d = Delta::decrement(seq, key, node_id, delta);
-        self.append_delta(d.clone());
+        self.store_delta(d.clone());
         d
     }
 
-    /// Append a delta to the log
-    fn append_delta(&mut self, delta: Delta) {
-        let index = (self.head_seq as usize) % REPLICATION_LOG_SIZE;
+    /// Store a delta in the ring buffer (seq already assigned)
+    fn store_delta(&mut self, delta: Delta) {
+        let index = (delta.seq as usize) % REPLICATION_LOG_SIZE;
         self.buffer[index] = Some(delta);
-        self.head_seq += 1;
     }
 
     /// Get the current head sequence (next write position)
     #[inline]
     pub fn head_seq(&self) -> u64 {
+        self.head_seq
+    }
+
+    /// Get the next sequence number and increment (for non-replicated operations like set/quota).
+    /// This ensures WAL ordering consistency without storing a delta in the replication log.
+    /// Sequence numbers start at 1 (0 indicates "no data").
+    #[inline]
+    pub fn next_seq(&mut self) -> u64 {
+        self.head_seq += 1;
         self.head_seq
     }
 
@@ -66,10 +76,11 @@ impl ReplicationLog {
         }
     }
 
-    /// Check if a sequence is still available in the buffer
+    /// Check if a sequence is still available in the buffer.
+    /// Note: seq 0 is never valid (sequence numbers start at 1).
     #[inline]
     pub fn is_available(&self, seq: u64) -> bool {
-        seq >= self.tail_seq() && seq < self.head_seq
+        seq > 0 && seq >= self.tail_seq() && seq <= self.head_seq
     }
 
     /// Get a delta by sequence number
@@ -81,15 +92,15 @@ impl ReplicationLog {
         self.buffer[index].as_ref()
     }
 
-    /// Iterate over deltas from start_seq (inclusive) to head_seq (exclusive)
+    /// Iterate over deltas from start_seq (inclusive) to head_seq (inclusive)
     /// Returns None if start_seq is no longer available (peer too far behind)
     pub fn iter_from(&self, start_seq: u64) -> Option<ReplicationLogIter<'_>> {
         if start_seq > self.head_seq {
             // Peer is ahead of us (shouldn't happen normally)
             return Some(ReplicationLogIter {
                 log: self,
-                current: self.head_seq,
-                end: self.head_seq,
+                current: self.head_seq + 1,
+                end: self.head_seq + 1,
             });
         }
 
@@ -101,7 +112,7 @@ impl ReplicationLog {
         Some(ReplicationLogIter {
             log: self,
             current: start_seq,
-            end: self.head_seq,
+            end: self.head_seq + 1, // +1 to include head_seq
         })
     }
 
@@ -180,17 +191,22 @@ mod tests {
         log.append_increment(Key::from("key2"), node, 20);
         log.append_decrement(Key::from("key3"), node, 5);
 
+        // Seq numbers start at 1, so after 3 appends head_seq is 3
         assert_eq!(log.head_seq(), 3);
 
-        let d0 = log.get(0).unwrap();
-        assert_eq!(d0.delta_p, 10);
-        assert_eq!(d0.key.as_bytes(), b"key1");
-
+        // First entry has seq=1
         let d1 = log.get(1).unwrap();
-        assert_eq!(d1.delta_p, 20);
+        assert_eq!(d1.delta_p, 10);
+        assert_eq!(d1.key.as_bytes(), b"key1");
 
         let d2 = log.get(2).unwrap();
-        assert_eq!(d2.delta_n, 5);
+        assert_eq!(d2.delta_p, 20);
+
+        let d3 = log.get(3).unwrap();
+        assert_eq!(d3.delta_n, 5);
+
+        // Seq 0 doesn't exist
+        assert!(log.get(0).is_none());
     }
 
     #[test]
@@ -202,10 +218,12 @@ mod tests {
             log.append_increment(Key::from(format!("key{}", i)), node, i as u64);
         }
 
+        // Seq numbers are 1..=10
+        // iter_from(5) returns entries with seq 5, 6, 7, 8, 9, 10
         let deltas: Vec<_> = log.iter_from(5).unwrap().collect();
-        assert_eq!(deltas.len(), 5);
+        assert_eq!(deltas.len(), 6);
         assert_eq!(deltas[0].seq, 5);
-        assert_eq!(deltas[4].seq, 9);
+        assert_eq!(deltas[5].seq, 10);
     }
 
     #[test]

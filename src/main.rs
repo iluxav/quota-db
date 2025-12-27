@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quota_db::config::Config;
 use quota_db::engine::ShardedDb;
+use quota_db::persistence::PersistenceManager;
 use quota_db::replication::{ReplicationConfig, ReplicationManager};
 use quota_db::server::Listener;
 
@@ -39,13 +40,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get persistence config
     let persistence_config = config.persistence_config();
 
-    // Create the sharded database (with recovery if enabled)
-    let db = if persistence_config.enabled {
-        info!("Persistence enabled, data dir: {:?}", persistence_config.data_dir);
-        Arc::new(ShardedDb::with_persistence(&config, &persistence_config))
+    // Create persistence manager and handle if enabled
+    let (persistence_manager, persistence_handle) = if persistence_config.enabled {
+        info!(
+            "Persistence enabled, data dir: {:?}",
+            persistence_config.data_dir
+        );
+        let (manager, handle) =
+            PersistenceManager::new(persistence_config.clone(), config.shards);
+        (Some(manager), Some(handle))
     } else {
-        Arc::new(ShardedDb::new(&config))
+        (None, None)
     };
+
+    // Create the sharded database (with recovery if enabled)
+    let db = Arc::new(ShardedDb::with_persistence(
+        &config,
+        &persistence_config,
+        persistence_handle,
+    ));
 
     // Start TTL expiration task if enabled
     if config.enable_ttl {
@@ -65,6 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    }
+
+    // Start persistence manager if enabled
+    if let Some(mut manager) = persistence_manager {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            // Create a closure that can get shard snapshots from the database
+            let get_snapshot = move |shard_id: u16| db_clone.create_persistence_snapshot(shard_id);
+            manager.run(get_snapshot).await;
+        });
+        info!("Persistence manager started");
     }
 
     // Set up replication if peers are configured
