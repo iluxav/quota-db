@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quota_db::config::Config;
 use quota_db::engine::ShardedDb;
-use quota_db::metrics::METRICS;
+use quota_db::metrics::{run_metrics_server, METRICS};
 use quota_db::persistence::PersistenceManager;
 use quota_db::replication::{ReplicationConfig, ReplicationManager};
 use quota_db::server::Listener;
@@ -175,6 +175,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener_handle = tokio::spawn(async move {
         listener.run_with_shutdown(listener_shutdown).await
     });
+
+    // Start metrics server if enabled
+    if config.metrics {
+        let metrics_addr = config.metrics_addr();
+        tokio::spawn(async move {
+            if let Err(e) = run_metrics_server(metrics_addr).await {
+                warn!("Metrics server error: {}", e);
+            }
+        });
+    }
 
     // Wait for shutdown signal
     tokio::select! {

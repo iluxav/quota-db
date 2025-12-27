@@ -91,6 +91,16 @@ pub struct Config {
     /// Write timeout for slow clients in milliseconds
     #[arg(long, default_value = "5000")]
     pub write_timeout_ms: u64,
+
+    // === Observability settings ===
+
+    /// Enable Prometheus metrics HTTP endpoint
+    #[arg(long, default_value = "false")]
+    pub metrics: bool,
+
+    /// Port for Prometheus metrics endpoint (e.g., http://localhost:9090/metrics)
+    #[arg(long, default_value = "9090")]
+    pub metrics_port: u16,
 }
 
 impl Config {
@@ -124,6 +134,11 @@ impl Config {
     pub fn write_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.write_timeout_ms)
     }
+
+    /// Get the metrics server address.
+    pub fn metrics_addr(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.metrics_port))
+    }
 }
 
 impl Default for Config {
@@ -149,6 +164,8 @@ impl Default for Config {
             snapshot_wal_mb: 64,
             wal_channel_size: 10_000,
             write_timeout_ms: 5_000,
+            metrics: false,
+            metrics_port: 9090,
         }
     }
 }

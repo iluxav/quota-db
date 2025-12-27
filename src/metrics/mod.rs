@@ -4,8 +4,10 @@
 //! operational metrics like command counts, latencies, and replication lag.
 
 mod histogram;
+mod server;
 
 pub use histogram::LatencyHistogram;
+pub use server::run_metrics_server;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -367,6 +369,146 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    /// Format as Prometheus text exposition format.
+    pub fn to_prometheus_string(&self) -> String {
+        let mut out = String::with_capacity(4096);
+
+        // Server info
+        out.push_str("# HELP quotadb_uptime_seconds Server uptime in seconds\n");
+        out.push_str("# TYPE quotadb_uptime_seconds gauge\n");
+        out.push_str(&format!("quotadb_uptime_seconds {}\n", self.uptime_secs));
+
+        // Command counters
+        out.push_str("# HELP quotadb_commands_total Total commands processed\n");
+        out.push_str("# TYPE quotadb_commands_total counter\n");
+        out.push_str(&format!("quotadb_commands_total {}\n", self.commands_total));
+
+        out.push_str("# HELP quotadb_commands Commands by type\n");
+        out.push_str("# TYPE quotadb_commands counter\n");
+        out.push_str(&format!("quotadb_commands{{type=\"incr\"}} {}\n", self.commands_incr));
+        out.push_str(&format!("quotadb_commands{{type=\"decr\"}} {}\n", self.commands_decr));
+        out.push_str(&format!("quotadb_commands{{type=\"get\"}} {}\n", self.commands_get));
+        out.push_str(&format!("quotadb_commands{{type=\"set\"}} {}\n", self.commands_set));
+        out.push_str(&format!("quotadb_commands{{type=\"ping\"}} {}\n", self.commands_ping));
+        out.push_str(&format!("quotadb_commands{{type=\"info\"}} {}\n", self.commands_info));
+        out.push_str(&format!("quotadb_commands{{type=\"quota\"}} {}\n", self.commands_quota));
+        out.push_str(&format!("quotadb_commands{{type=\"other\"}} {}\n", self.commands_other));
+
+        // Errors
+        out.push_str("# HELP quotadb_errors_total Total errors by type\n");
+        out.push_str("# TYPE quotadb_errors_total counter\n");
+        out.push_str(&format!("quotadb_errors_total{{type=\"parse\"}} {}\n", self.errors_parse));
+        out.push_str(&format!("quotadb_errors_total{{type=\"unknown_cmd\"}} {}\n", self.errors_unknown_cmd));
+
+        // Connections
+        out.push_str("# HELP quotadb_connections_total Total connections received\n");
+        out.push_str("# TYPE quotadb_connections_total counter\n");
+        out.push_str(&format!("quotadb_connections_total {}\n", self.connections_total));
+
+        out.push_str("# HELP quotadb_connections_active Current active connections\n");
+        out.push_str("# TYPE quotadb_connections_active gauge\n");
+        out.push_str(&format!("quotadb_connections_active {}\n", self.connections_active));
+
+        // Latency histograms (as summary with quantiles)
+        out.push_str("# HELP quotadb_command_duration_microseconds Command latency in microseconds\n");
+        out.push_str("# TYPE quotadb_command_duration_microseconds summary\n");
+
+        // INCR latency
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"incr\",quantile=\"0.5\"}} {}\n", self.latency_incr.p50));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"incr\",quantile=\"0.95\"}} {}\n", self.latency_incr.p95));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"incr\",quantile=\"0.99\"}} {}\n", self.latency_incr.p99));
+        out.push_str(&format!("quotadb_command_duration_microseconds_count{{cmd=\"incr\"}} {}\n", self.latency_incr.count));
+
+        // GET latency
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"get\",quantile=\"0.5\"}} {}\n", self.latency_get.p50));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"get\",quantile=\"0.95\"}} {}\n", self.latency_get.p95));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"get\",quantile=\"0.99\"}} {}\n", self.latency_get.p99));
+        out.push_str(&format!("quotadb_command_duration_microseconds_count{{cmd=\"get\"}} {}\n", self.latency_get.count));
+
+        // DECR latency
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"decr\",quantile=\"0.5\"}} {}\n", self.latency_decr.p50));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"decr\",quantile=\"0.95\"}} {}\n", self.latency_decr.p95));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"decr\",quantile=\"0.99\"}} {}\n", self.latency_decr.p99));
+        out.push_str(&format!("quotadb_command_duration_microseconds_count{{cmd=\"decr\"}} {}\n", self.latency_decr.count));
+
+        // SET latency
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"set\",quantile=\"0.5\"}} {}\n", self.latency_set.p50));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"set\",quantile=\"0.95\"}} {}\n", self.latency_set.p95));
+        out.push_str(&format!("quotadb_command_duration_microseconds{{cmd=\"set\",quantile=\"0.99\"}} {}\n", self.latency_set.p99));
+        out.push_str(&format!("quotadb_command_duration_microseconds_count{{cmd=\"set\"}} {}\n", self.latency_set.count));
+
+        // Replication metrics
+        out.push_str("# HELP quotadb_replication_deltas_sent Total replication deltas sent\n");
+        out.push_str("# TYPE quotadb_replication_deltas_sent counter\n");
+        out.push_str(&format!("quotadb_replication_deltas_sent {}\n", self.replication_deltas_sent));
+
+        out.push_str("# HELP quotadb_replication_deltas_received Total replication deltas received\n");
+        out.push_str("# TYPE quotadb_replication_deltas_received counter\n");
+        out.push_str(&format!("quotadb_replication_deltas_received {}\n", self.replication_deltas_received));
+
+        out.push_str("# HELP quotadb_replication_bytes_sent Replication bytes sent\n");
+        out.push_str("# TYPE quotadb_replication_bytes_sent counter\n");
+        out.push_str(&format!("quotadb_replication_bytes_sent {}\n", self.replication_bytes_sent));
+
+        out.push_str("# HELP quotadb_replication_bytes_received Replication bytes received\n");
+        out.push_str("# TYPE quotadb_replication_bytes_received counter\n");
+        out.push_str(&format!("quotadb_replication_bytes_received {}\n", self.replication_bytes_received));
+
+        out.push_str("# HELP quotadb_replication_dropped Replication messages dropped due to backpressure\n");
+        out.push_str("# TYPE quotadb_replication_dropped counter\n");
+        out.push_str(&format!("quotadb_replication_dropped {}\n", self.replication_dropped));
+
+        out.push_str("# HELP quotadb_replication_lag_max Maximum replication lag across all peers\n");
+        out.push_str("# TYPE quotadb_replication_lag_max gauge\n");
+        out.push_str(&format!("quotadb_replication_lag_max {}\n", self.replication_lag.max_lag));
+
+        out.push_str("# HELP quotadb_replication_peers Number of replication peers\n");
+        out.push_str("# TYPE quotadb_replication_peers gauge\n");
+        out.push_str(&format!("quotadb_replication_peers {}\n", self.replication_lag.peer_count));
+
+        // Replication RTT
+        out.push_str("# HELP quotadb_replication_rtt_microseconds Replication round-trip time\n");
+        out.push_str("# TYPE quotadb_replication_rtt_microseconds summary\n");
+        out.push_str(&format!("quotadb_replication_rtt_microseconds{{quantile=\"0.5\"}} {}\n", self.replication_rtt.p50));
+        out.push_str(&format!("quotadb_replication_rtt_microseconds{{quantile=\"0.99\"}} {}\n", self.replication_rtt.p99));
+
+        // Persistence metrics
+        out.push_str("# HELP quotadb_wal_writes Total WAL writes\n");
+        out.push_str("# TYPE quotadb_wal_writes counter\n");
+        out.push_str(&format!("quotadb_wal_writes {}\n", self.wal_writes));
+
+        out.push_str("# HELP quotadb_wal_bytes_written Total WAL bytes written\n");
+        out.push_str("# TYPE quotadb_wal_bytes_written counter\n");
+        out.push_str(&format!("quotadb_wal_bytes_written {}\n", self.wal_bytes_written));
+
+        out.push_str("# HELP quotadb_snapshots_created Total snapshots created\n");
+        out.push_str("# TYPE quotadb_snapshots_created counter\n");
+        out.push_str(&format!("quotadb_snapshots_created {}\n", self.snapshots_created));
+
+        out.push_str("# HELP quotadb_wal_dropped WAL entries dropped due to backpressure\n");
+        out.push_str("# TYPE quotadb_wal_dropped counter\n");
+        out.push_str(&format!("quotadb_wal_dropped {}\n", self.wal_dropped));
+
+        out.push_str("# HELP quotadb_wal_sync_failures WAL sync failures\n");
+        out.push_str("# TYPE quotadb_wal_sync_failures counter\n");
+        out.push_str(&format!("quotadb_wal_sync_failures {}\n", self.wal_sync_failures));
+
+        // Buffer pool metrics
+        out.push_str("# HELP quotadb_buffer_pool_size Current buffer pool size\n");
+        out.push_str("# TYPE quotadb_buffer_pool_size gauge\n");
+        out.push_str(&format!("quotadb_buffer_pool_size {}\n", self.pool_size));
+
+        out.push_str("# HELP quotadb_buffer_pool_hits Buffer pool cache hits\n");
+        out.push_str("# TYPE quotadb_buffer_pool_hits counter\n");
+        out.push_str(&format!("quotadb_buffer_pool_hits {}\n", self.pool_hits));
+
+        out.push_str("# HELP quotadb_buffer_pool_misses Buffer pool cache misses\n");
+        out.push_str("# TYPE quotadb_buffer_pool_misses counter\n");
+        out.push_str(&format!("quotadb_buffer_pool_misses {}\n", self.pool_misses));
+
+        out
+    }
+
     /// Format as Redis INFO-style output.
     pub fn to_info_string(&self, section: Option<&str>) -> String {
         let mut out = String::with_capacity(2048);
