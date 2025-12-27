@@ -43,11 +43,15 @@ pub struct Metrics {
     pub replication_deltas_received: AtomicU64,
     pub replication_bytes_sent: AtomicU64,
     pub replication_bytes_received: AtomicU64,
+    /// Deltas dropped due to backpressure (channel full)
+    pub replication_dropped: AtomicU64,
 
     // Persistence metrics
     pub wal_writes: AtomicU64,
     pub wal_bytes_written: AtomicU64,
     pub snapshots_created: AtomicU64,
+    /// WAL entries dropped due to backpressure
+    pub wal_dropped: AtomicU64,
 
     // Latency histograms (stored separately for each command type)
     pub latency_incr: LatencyHistogram,
@@ -103,10 +107,12 @@ impl Metrics {
             replication_deltas_received: AtomicU64::new(0),
             replication_bytes_sent: AtomicU64::new(0),
             replication_bytes_received: AtomicU64::new(0),
+            replication_dropped: AtomicU64::new(0),
 
             wal_writes: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
             snapshots_created: AtomicU64::new(0),
+            wal_dropped: AtomicU64::new(0),
 
             latency_incr: LatencyHistogram::new(),
             latency_decr: LatencyHistogram::new(),
@@ -261,10 +267,12 @@ impl Metrics {
             replication_deltas_received: self.replication_deltas_received.load(RELAXED),
             replication_bytes_sent: self.replication_bytes_sent.load(RELAXED),
             replication_bytes_received: self.replication_bytes_received.load(RELAXED),
+            replication_dropped: self.replication_dropped.load(RELAXED),
 
             wal_writes: self.wal_writes.load(RELAXED),
             wal_bytes_written: self.wal_bytes_written.load(RELAXED),
             snapshots_created: self.snapshots_created.load(RELAXED),
+            wal_dropped: self.wal_dropped.load(RELAXED),
 
             latency_incr: self.latency_incr.percentiles(),
             latency_decr: self.latency_decr.percentiles(),
@@ -325,10 +333,12 @@ pub struct MetricsSnapshot {
     pub replication_deltas_received: u64,
     pub replication_bytes_sent: u64,
     pub replication_bytes_received: u64,
+    pub replication_dropped: u64,
 
     pub wal_writes: u64,
     pub wal_bytes_written: u64,
     pub snapshots_created: u64,
+    pub wal_dropped: u64,
 
     pub latency_incr: LatencyPercentiles,
     pub latency_decr: LatencyPercentiles,
@@ -459,6 +469,10 @@ impl MetricsSnapshot {
                 "replication_rtt_p99:{}\r\n",
                 self.replication_rtt.p99
             ));
+            out.push_str(&format!(
+                "replication_dropped:{}\r\n",
+                self.replication_dropped
+            ));
             out.push_str("\r\n");
         }
 
@@ -473,6 +487,7 @@ impl MetricsSnapshot {
                 "snapshots_created:{}\r\n",
                 self.snapshots_created
             ));
+            out.push_str(&format!("wal_dropped:{}\r\n", self.wal_dropped));
             out.push_str("\r\n");
         }
 

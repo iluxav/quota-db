@@ -52,6 +52,10 @@ pub struct Config {
     #[arg(long, default_value = "10")]
     pub batch_max_delay_ms: u64,
 
+    /// Replication channel buffer size for backpressure
+    #[arg(long, default_value = "10000")]
+    pub replication_channel_size: usize,
+
     // === Persistence settings ===
 
     /// Enable persistence (WAL + snapshots)
@@ -77,6 +81,16 @@ pub struct Config {
     /// Snapshot WAL size threshold in MB
     #[arg(long, default_value = "64")]
     pub snapshot_wal_mb: u64,
+
+    /// WAL channel buffer size for backpressure
+    #[arg(long, default_value = "10000")]
+    pub wal_channel_size: usize,
+
+    // === Connection settings ===
+
+    /// Write timeout for slow clients in milliseconds
+    #[arg(long, default_value = "5000")]
+    pub write_timeout_ms: u64,
 }
 
 impl Config {
@@ -102,7 +116,13 @@ impl Config {
             wal_sync_ops: self.wal_sync_ops,
             snapshot_interval: Duration::from_secs(self.snapshot_interval_secs),
             snapshot_wal_threshold: self.snapshot_wal_mb * 1024 * 1024,
+            wal_channel_size: self.wal_channel_size,
         }
+    }
+
+    /// Get the write timeout duration.
+    pub fn write_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.write_timeout_ms)
     }
 }
 
@@ -120,12 +140,15 @@ impl Default for Config {
             replication_port: 6381,
             batch_max_size: 100,
             batch_max_delay_ms: 10,
+            replication_channel_size: 10_000,
             persistence: false,
             data_dir: "./data".to_string(),
             wal_sync_ms: 100,
             wal_sync_ops: 1000,
             snapshot_interval_secs: 300,
             snapshot_wal_mb: 64,
+            wal_channel_size: 10_000,
+            write_timeout_ms: 5_000,
         }
     }
 }

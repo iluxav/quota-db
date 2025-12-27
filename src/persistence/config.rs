@@ -21,6 +21,9 @@ pub struct PersistenceConfig {
 
     /// Snapshot WAL size threshold in bytes (default: 64MB)
     pub snapshot_wal_threshold: u64,
+
+    /// WAL channel buffer size for backpressure (default: 10000)
+    pub wal_channel_size: usize,
 }
 
 impl Default for PersistenceConfig {
@@ -32,6 +35,7 @@ impl Default for PersistenceConfig {
             wal_sync_interval: Duration::from_millis(100),
             snapshot_interval: Duration::from_secs(300),
             snapshot_wal_threshold: 64 * 1024 * 1024,
+            wal_channel_size: 10_000,
         }
     }
 }

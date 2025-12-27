@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_shards: config.shards,
                 batch_max_size: config.batch_max_size,
                 batch_max_delay: Duration::from_millis(config.batch_max_delay_ms),
+                channel_capacity: config.replication_channel_size,
             };
 
             let (manager, handle) = ReplicationManager::new(rep_config);

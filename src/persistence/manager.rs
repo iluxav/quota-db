@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::metrics::METRICS;
 use crate::persistence::{
     write_snapshot, PersistenceConfig, ShardSnapshot, WalEntry, WalOp, WalWriter,
 };
@@ -108,9 +109,10 @@ impl PersistenceHandle {
 
     fn send(&self, shard_id: u16, entry: WalEntry) {
         let msg = WalMessage { shard_id, entry };
-        // Use try_send to avoid blocking - if channel is full, log warning
+        // Use try_send to avoid blocking - if channel is full, track and warn
         if let Err(e) = self.tx.try_send(msg) {
-            warn!("Failed to send WAL message: {}", e);
+            METRICS.inc(&METRICS.wal_dropped);
+            warn!("WAL backpressure: dropped message for shard {}: {}", shard_id, e);
         }
     }
 
@@ -132,8 +134,9 @@ pub struct PersistenceManager {
 impl PersistenceManager {
     /// Create a new persistence manager.
     pub fn new(config: PersistenceConfig, num_shards: usize) -> (Self, PersistenceHandle) {
+        let channel_size = config.wal_channel_size;
         let config = Arc::new(config);
-        let (tx, rx) = mpsc::channel(10000); // Buffer up to 10k messages
+        let (tx, rx) = mpsc::channel(channel_size);
 
         // Initialize per-shard writers
         let writers: Vec<_> = (0..num_shards)

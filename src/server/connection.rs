@@ -1,6 +1,7 @@
 use bytes::BytesMut;
 use smallvec::SmallVec;
 use std::io;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 
@@ -12,6 +13,9 @@ const READ_BUFFER_SIZE: usize = 8192;
 
 /// Write buffer size
 const WRITE_BUFFER_SIZE: usize = 8192;
+
+/// Default write timeout for slow clients (5 seconds)
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-connection handler managing read/write frames.
 pub struct Connection {
@@ -90,11 +94,31 @@ impl Connection {
 
     /// Flush all buffered writes to the socket.
     pub async fn flush(&mut self) -> io::Result<()> {
+        self.flush_with_timeout(DEFAULT_WRITE_TIMEOUT).await
+    }
+
+    /// Flush all buffered writes to the socket with a timeout.
+    /// Protects against slow clients that don't consume data.
+    pub async fn flush_with_timeout(&mut self, timeout: Duration) -> io::Result<()> {
         if !self.write_buffer.is_empty() {
-            self.stream.write_all(&self.write_buffer).await?;
+            match tokio::time::timeout(timeout, self.stream.write_all(&self.write_buffer)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.write_buffer.clear();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "write timeout: slow client",
+                    ));
+                }
+            }
             self.write_buffer.clear();
         }
-        self.stream.flush().await?;
-        Ok(())
+        match tokio::time::timeout(timeout, self.stream.flush()).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "flush timeout: slow client",
+            )),
+        }
     }
 }

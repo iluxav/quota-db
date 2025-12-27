@@ -33,6 +33,8 @@ pub struct ReplicationConfig {
     pub batch_max_size: usize,
     /// Maximum delay before flushing
     pub batch_max_delay: Duration,
+    /// Channel capacity for delta notifications (backpressure)
+    pub channel_capacity: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -44,28 +46,44 @@ impl Default for ReplicationConfig {
             num_shards: 64,
             batch_max_size: 100,
             batch_max_delay: Duration::from_millis(10),
+            channel_capacity: DEFAULT_DELTA_CHANNEL_CAPACITY,
         }
     }
 }
 
+/// Default capacity for the delta replication channel.
+/// This provides backpressure when replication can't keep up.
+pub const DEFAULT_DELTA_CHANNEL_CAPACITY: usize = 10000;
+
 /// Handle for sending deltas to the replication manager
 #[derive(Clone)]
 pub struct ReplicationHandle {
-    tx: mpsc::UnboundedSender<DeltaNotification>,
+    tx: mpsc::Sender<DeltaNotification>,
 }
 
 impl ReplicationHandle {
-    /// Send a delta to be replicated
+    /// Send a delta to be replicated.
+    /// Uses try_send to avoid blocking the hot path.
+    /// If the channel is full, the delta is dropped and a metric is incremented.
     pub fn send(&self, shard_id: u16, delta: Delta) {
-        let _ = self.tx.send(DeltaNotification { shard_id, delta });
+        if let Err(_) = self.tx.try_send(DeltaNotification { shard_id, delta }) {
+            // Channel full - replication is lagging behind
+            // This is tracked in metrics; anti-entropy will repair gaps
+            METRICS.inc(&METRICS.replication_dropped);
+        }
+    }
+
+    /// Check if the channel has capacity (for testing/monitoring).
+    pub fn has_capacity(&self) -> bool {
+        self.tx.capacity() > 0
     }
 }
 
 /// Replication manager - handles all peer connections and delta streaming
 pub struct ReplicationManager {
     config: ReplicationConfig,
-    /// Channel to receive deltas from shards
-    delta_rx: mpsc::UnboundedReceiver<DeltaNotification>,
+    /// Channel to receive deltas from shards (bounded for backpressure)
+    delta_rx: mpsc::Receiver<DeltaNotification>,
     /// Outbound peer states (we connect to these)
     outbound_peers: HashMap<SocketAddr, PeerState>,
     /// Active writers for sending to peers
@@ -83,7 +101,7 @@ pub struct ReplicationManager {
 impl ReplicationManager {
     /// Create a new replication manager
     pub fn new(config: ReplicationConfig) -> (Self, ReplicationHandle) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
 
         let num_nodes = config.peers.len() + 1; // peers + self
         let mut outbound_peers = HashMap::new();
