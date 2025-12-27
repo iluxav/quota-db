@@ -6,10 +6,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "1", "--replication-port", "6381", "--peers", "node2:6381,node3:6381"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "1", "--replication-port", "6381", "--peers", "node2:6381,node3:6381", "--metrics", "--metrics-port", "9090"]
     ports:
       - "6380:6380"   # Client port
       - "6381:6381"   # Replication port
+      - "9190:9090"   # Metrics port (host 9190 -> container 9090)
     deploy:
       resources:
         limits:
@@ -27,10 +28,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "2", "--replication-port", "6381", "--peers", "node1:6381,node3:6381"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "2", "--replication-port", "6381", "--peers", "node1:6381,node3:6381", "--metrics", "--metrics-port", "9090"]
     ports:
       - "6382:6380"   # Client port (mapped to 6382 on host)
       - "6383:6381"   # Replication port
+      - "9191:9090"   # Metrics port (host 9191 -> container 9090)
     deploy:
       resources:
         limits:
@@ -48,10 +50,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "3", "--replication-port", "6381", "--peers", "node1:6381,node2:6381"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "3", "--replication-port", "6381", "--peers", "node1:6381,node2:6381", "--metrics", "--metrics-port", "9090"]
     ports:
       - "6384:6380"   # Client port (mapped to 6384 on host)
       - "6385:6381"   # Replication port
+      - "9192:9090"   # Metrics port (host 9192 -> container 9090)
     deploy:
       resources:
         limits:

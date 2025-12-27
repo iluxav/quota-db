@@ -4,7 +4,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "6380:6380"
+      - "6380:6380"   # Client port
+      - "9190:9090"   # Metrics port (host 9190 -> container 9090)
     deploy:
       resources:
         limits:
