@@ -1,3 +1,7 @@
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::Key;
@@ -91,6 +95,55 @@ pub struct AllocatorSnapshot {
     pub window_start: u64,
 }
 
+/// Write a snapshot atomically (write to .tmp, then rename).
+pub fn write_snapshot(path: &Path, snapshot: &ShardSnapshot) -> io::Result<()> {
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("bin.tmp");
+
+    // Write to temp file
+    {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+
+        let data = bincode::serialize(snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        writer.write_all(&data)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+
+    // Atomic rename
+    fs::rename(&tmp_path, path)?;
+
+    Ok(())
+}
+
+/// Read a snapshot from file.
+pub fn read_snapshot(path: &Path) -> io::Result<ShardSnapshot> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+
+    let snapshot: ShardSnapshot = bincode::deserialize(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if !snapshot.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid snapshot header",
+        ));
+    }
+
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +190,51 @@ mod tests {
         assert_eq!(decoded.quotas.len(), 1);
         assert_eq!(decoded.allocators.len(), 1);
         assert_eq!(decoded.counters[0].key.as_bytes(), b"counter1");
+    }
+
+    #[test]
+    fn test_snapshot_write_read() {
+        let dir = std::env::temp_dir().join("quota-db-test-snapshot-rw");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("snapshot.bin");
+
+        let mut snap = ShardSnapshot::new(3, 1, 1000, 555);
+        snap.counters.push(CounterSnapshot {
+            key: Key::from("test"),
+            p_values: vec![(1, 50)],
+            n_values: vec![],
+            expires_at: None,
+        });
+
+        write_snapshot(&path, &snap).unwrap();
+        assert!(path.exists());
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.shard_id, 3);
+        assert_eq!(loaded.seq, 1000);
+        assert_eq!(loaded.counters.len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_atomic_write() {
+        let dir = std::env::temp_dir().join("quota-db-test-snapshot-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("snapshot.bin");
+        let tmp_path = path.with_extension("bin.tmp");
+
+        let snap = ShardSnapshot::new(0, 1, 100, 0);
+        write_snapshot(&path, &snap).unwrap();
+
+        // Temp file should not exist after successful write
+        assert!(!tmp_path.exists());
+        assert!(path.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
