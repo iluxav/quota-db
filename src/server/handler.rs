@@ -254,6 +254,19 @@ impl Handler {
                     Frame::Array(key_frames),
                 ])
             }
+            Command::ClusterInfo => {
+                if let Some(ref handle) = self.replication {
+                    let info = handle.cluster_info();
+                    Frame::Bulk(bytes::Bytes::from(info.to_info_string()))
+                } else {
+                    // Not in cluster mode
+                    let info = format!(
+                        "# Cluster\ncluster_enabled:0\ncluster_node_id:{}\n",
+                        self.db.node_id().as_u32()
+                    );
+                    Frame::Bulk(bytes::Bytes::from(info))
+                }
+            }
         }
     }
 

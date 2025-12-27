@@ -1,6 +1,6 @@
 use crate::engine::ShardedDb;
 use crate::metrics::{ReplicationLagMetrics, METRICS};
-use crate::replication::{AntiEntropyConfig, AntiEntropyTask, Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerState};
+use crate::replication::{AntiEntropyConfig, AntiEntropyTask, ClusterState, ClusterStateSnapshot, Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerInfo, PeerState};
 use crate::types::NodeId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -59,6 +59,7 @@ pub const DEFAULT_DELTA_CHANNEL_CAPACITY: usize = 10000;
 #[derive(Clone)]
 pub struct ReplicationHandle {
     tx: mpsc::Sender<DeltaNotification>,
+    cluster_state: Arc<ClusterState>,
 }
 
 impl ReplicationHandle {
@@ -76,6 +77,11 @@ impl ReplicationHandle {
     /// Check if the channel has capacity (for testing/monitoring).
     pub fn has_capacity(&self) -> bool {
         self.tx.capacity() > 0
+    }
+
+    /// Get a snapshot of the cluster state
+    pub fn cluster_info(&self) -> ClusterStateSnapshot {
+        self.cluster_state.snapshot()
     }
 }
 
@@ -96,12 +102,20 @@ pub struct ReplicationManager {
     anti_entropy: Option<AntiEntropyTask>,
     /// Anti-entropy configuration
     anti_entropy_config: AntiEntropyConfig,
+    /// Shared cluster state for CLUSTER INFO
+    cluster_state: Arc<ClusterState>,
 }
 
 impl ReplicationManager {
     /// Create a new replication manager
     pub fn new(config: ReplicationConfig) -> (Self, ReplicationHandle) {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
+
+        let cluster_state = ClusterState::new(
+            config.node_id,
+            config.listen_port,
+            config.num_shards,
+        );
 
         let num_nodes = config.peers.len() + 1; // peers + self
         let mut outbound_peers = HashMap::new();
@@ -118,9 +132,10 @@ impl ReplicationManager {
             num_nodes,
             anti_entropy: None,
             anti_entropy_config: AntiEntropyConfig::default(),
+            cluster_state: cluster_state.clone(),
         };
 
-        let handle = ReplicationHandle { tx };
+        let handle = ReplicationHandle { tx, cluster_state };
         (manager, handle)
     }
 
@@ -327,6 +342,7 @@ impl ReplicationManager {
                 // Update metrics periodically
                 _ = metrics_interval.tick() => {
                     self.update_lag_metrics();
+                    self.update_cluster_state();
                 }
 
                 // Handle disconnections
@@ -434,6 +450,33 @@ impl ReplicationManager {
             peer_count,
             per_peer,
         });
+    }
+
+    /// Update cluster state snapshot for CLUSTER INFO
+    fn update_cluster_state(&self) {
+        use std::time::Instant;
+
+        let peers: Vec<PeerInfo> = self.outbound_peers.values().map(|peer| {
+            let (acked_min, acked_max) = if peer.acked_seq.is_empty() {
+                (0, 0)
+            } else {
+                let min = *peer.acked_seq.iter().min().unwrap_or(&0);
+                let max = *peer.acked_seq.iter().max().unwrap_or(&0);
+                (min, max)
+            };
+
+            PeerInfo {
+                addr: peer.addr,
+                node_id: peer.node_id,
+                state: peer.state,
+                acked_seq_min: acked_min,
+                acked_seq_max: acked_max,
+                pending_count: peer.pending.len(),
+                last_activity: Instant::now(), // Approximate, we don't track exact activity time
+            }
+        }).collect();
+
+        self.cluster_state.update_peers(peers);
     }
 
     /// Handle a message from a peer

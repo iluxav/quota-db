@@ -64,6 +64,9 @@ pub enum Command {
         pattern: Option<Bytes>,
         count: usize,
     },
+
+    /// CLUSTER INFO - return cluster state information
+    ClusterInfo,
 }
 
 impl Command {
@@ -225,6 +228,24 @@ impl Command {
                     count,
                 })
             }
+            b"CLUSTER" => {
+                // CLUSTER INFO or CLUSTER subcommand
+                if array.len() >= 2 {
+                    let subcommand = Self::extract_bytes(&array, 1)?;
+                    let sub_upper: Vec<u8> = subcommand.iter().map(|b| b.to_ascii_uppercase()).collect();
+                    match sub_upper.as_slice() {
+                        b"INFO" => Ok(Command::ClusterInfo),
+                        _ => Err(Error::UnknownCommand(format!(
+                            "CLUSTER {}",
+                            String::from_utf8_lossy(&subcommand)
+                        ))),
+                    }
+                } else {
+                    Err(Error::InvalidArgument(
+                        "wrong number of arguments for 'CLUSTER' command".into(),
+                    ))
+                }
+            }
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd_name);
                 Err(Error::UnknownCommand(cmd_str.to_string()))
@@ -306,6 +327,7 @@ impl Command {
             Command::Info(_) => "INFO",
             Command::Keys(_) => "KEYS",
             Command::Scan { .. } => "SCAN",
+            Command::ClusterInfo => "CLUSTER INFO",
         }
     }
 }

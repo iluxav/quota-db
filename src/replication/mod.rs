@@ -1,4 +1,5 @@
 mod anti_entropy;
+mod cluster_state;
 mod delta;
 mod digest;
 mod log;
@@ -8,6 +9,7 @@ mod protocol;
 mod quota_service;
 
 pub use anti_entropy::{AntiEntropyConfig, AntiEntropyTask, PeerAntiEntropyState};
+pub use cluster_state::{ClusterState, ClusterStateSnapshot, PeerInfo};
 pub use delta::Delta;
 pub use digest::ShardDigest;
 pub use log::{ReplicationLog, ReplicationLogIter, REPLICATION_LOG_SIZE};
