@@ -1,6 +1,7 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod persistence;
 pub mod protocol;
 pub mod replication;
 pub mod server;
