@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use rustc_hash::FxHasher;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -106,6 +107,25 @@ impl From<Bytes> for Key {
 impl From<Vec<u8>> for Key {
     fn from(v: Vec<u8>) -> Self {
         Self(Bytes::from(v))
+    }
+}
+
+impl Serialize for Key {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(self.0.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        Ok(Key::new(Bytes::from(bytes)))
     }
 }
 
