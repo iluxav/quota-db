@@ -6,21 +6,24 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "1", "--replication-port", "6381", "--peers", "node2:6381,node3:6381", "--metrics", "--metrics-port", "9090"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "1", "--replication-port", "6381", "--peers", "node2:6381,node3:6381", "--metrics", "--metrics-port", "9090", "--persistence", "--data-dir", "/data"]
     ports:
       - "6380:6380"   # Client port
       - "6381:6381"   # Replication port
       - "9190:9090"   # Metrics port (host 9190 -> container 9090)
+    volumes:
+      - ./data/node1:/data   # Persist data to local folder
     deploy:
       resources:
         limits:
           cpus: '2'
           memory: 2G
     healthcheck:
-      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD", "sh", "-c", "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | nc localhost 6380 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 30s
     networks:
       - quota-cluster
 
@@ -28,21 +31,24 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "2", "--replication-port", "6381", "--peers", "node1:6381,node3:6381", "--metrics", "--metrics-port", "9090"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "2", "--replication-port", "6381", "--peers", "node1:6381,node3:6381", "--metrics", "--metrics-port", "9090", "--persistence", "--data-dir", "/data"]
     ports:
       - "6382:6380"   # Client port (mapped to 6382 on host)
       - "6383:6381"   # Replication port
       - "9191:9090"   # Metrics port (host 9191 -> container 9090)
+    volumes:
+      - ./data/node2:/data   # Persist data to local folder
     deploy:
       resources:
         limits:
           cpus: '2'
           memory: 2G
     healthcheck:
-      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD", "sh", "-c", "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | nc localhost 6380 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 30s
     networks:
       - quota-cluster
 
@@ -50,21 +56,24 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["--bind", "0.0.0.0:6380", "--node-id", "3", "--replication-port", "6381", "--peers", "node1:6381,node2:6381", "--metrics", "--metrics-port", "9090"]
+    command: ["--bind", "0.0.0.0:6380", "--node-id", "3", "--replication-port", "6381", "--peers", "node1:6381,node2:6381", "--metrics", "--metrics-port", "9090", "--persistence", "--data-dir", "/data"]
     ports:
       - "6384:6380"   # Client port (mapped to 6384 on host)
       - "6385:6381"   # Replication port
       - "9192:9090"   # Metrics port (host 9192 -> container 9090)
+    volumes:
+      - ./data/node3:/data   # Persist data to local folder
     deploy:
       resources:
         limits:
           cpus: '2'
           memory: 2G
     healthcheck:
-      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD", "sh", "-c", "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | nc localhost 6380 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 30s
     networks:
       - quota-cluster
 

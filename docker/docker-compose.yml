@@ -7,7 +7,7 @@ services:
       - "6380:6380"   # Client port
       - "9190:9090"   # Metrics port (host 9190 -> container 9090)
     volumes:
-      - quota-db-data:/data   # Persist data across restarts
+      - ./data:/data   # Persist data to local ./docker/data/ folder
     deploy:
       resources:
         limits:
@@ -50,5 +50,3 @@ networks:
   quota-net:
     driver: bridge
 
-volumes:
-  quota-db-data:

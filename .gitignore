@@ -1,20 +1,16 @@
-# Rust
-/target/
-Cargo.lock
-
-# IDE
+.DS_Store
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Test artifacts
 *.log
-tmp/
-
+*.swo
+*.swp
+/target/
 # Docker data
+# IDE
+# OS
+# Rust
+# Test artifacts
+Cargo.lock
 docker/data/
+Thumbs.db
+tmp/
