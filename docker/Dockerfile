@@ -32,4 +32,4 @@ EXPOSE 6380 9090
 
 # Default command with metrics and persistence enabled
 ENTRYPOINT ["quota-db"]
-CMD ["--bind", "0.0.0.0:6380", "--metrics", "--metrics-port", "9090", "--persistence", "--data-dir", "/data", "--wal-channel-size", "100000"]
+CMD ["--bind", "0.0.0.0:6380", "--metrics", "--metrics-port", "9090", "--persistence", "--data-dir", "/data", "--wal-channel-size", "100000", "--wal-sync-ms", "200", "--wal-sync-ops", "5000"]
