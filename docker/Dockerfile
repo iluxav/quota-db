@@ -21,6 +21,11 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
+# Install netcat for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy the binary from builder
 COPY --from=builder /app/target/release/quota-db /usr/local/bin/quota-db
 

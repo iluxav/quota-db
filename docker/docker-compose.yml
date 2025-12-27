@@ -17,10 +17,12 @@ services:
           cpus: '1'
           memory: 1G
     healthcheck:
-      test: ["CMD", "sh", "-c", "echo PING | nc localhost 6380 | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
+      # Send RESP-encoded PING (*1\r\n$4\r\nPING\r\n) and check for PONG
+      test: ["CMD", "sh", "-c", "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | nc localhost 6380 | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 30s  # Allow time for persistence recovery on startup
     networks:
       - quota-net
 
