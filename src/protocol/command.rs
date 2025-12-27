@@ -54,6 +54,16 @@ pub enum Command {
 
     /// INFO [section] - return server statistics
     Info(Option<Bytes>),
+
+    /// KEYS pattern - return all keys matching pattern
+    Keys(Bytes),
+
+    /// SCAN cursor [MATCH pattern] [COUNT count] - incrementally iterate keys
+    Scan {
+        cursor: u64,
+        pattern: Option<Bytes>,
+        count: usize,
+    },
 }
 
 impl Command {
@@ -163,6 +173,58 @@ impl Command {
                 };
                 Ok(Command::Info(section))
             }
+            b"KEYS" => {
+                Self::ensure_args(&array, 2, "KEYS")?;
+                let pattern = Self::extract_bytes(&array, 1)?;
+                Ok(Command::Keys(pattern))
+            }
+            b"SCAN" => {
+                // SCAN cursor [MATCH pattern] [COUNT count]
+                if array.len() < 2 {
+                    return Err(Error::InvalidArgument(
+                        "wrong number of arguments for 'SCAN' command".into(),
+                    ));
+                }
+                let cursor = Self::extract_u64(&array, 1)?;
+                let mut pattern = None;
+                let mut count = 10; // Redis default
+
+                let mut i = 2;
+                while i < array.len() {
+                    let opt = Self::extract_bytes(&array, i)?;
+                    let opt_upper: Vec<u8> = opt.iter().map(|b| b.to_ascii_uppercase()).collect();
+                    match opt_upper.as_slice() {
+                        b"MATCH" => {
+                            i += 1;
+                            if i >= array.len() {
+                                return Err(Error::InvalidArgument(
+                                    "MATCH requires a pattern".into(),
+                                ));
+                            }
+                            pattern = Some(Self::extract_bytes(&array, i)?);
+                        }
+                        b"COUNT" => {
+                            i += 1;
+                            if i >= array.len() {
+                                return Err(Error::InvalidArgument(
+                                    "COUNT requires a number".into(),
+                                ));
+                            }
+                            count = Self::extract_u64(&array, i)? as usize;
+                        }
+                        _ => {
+                            // Ignore unknown options for compatibility
+                        }
+                    }
+                    i += 1;
+                }
+
+                Ok(Command::Scan {
+                    cursor,
+                    pattern,
+                    count,
+                })
+            }
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd_name);
                 Err(Error::UnknownCommand(cmd_str.to_string()))
@@ -242,6 +304,8 @@ impl Command {
             Command::DbSize => "DBSIZE",
             Command::Flush => "FLUSH",
             Command::Info(_) => "INFO",
+            Command::Keys(_) => "KEYS",
+            Command::Scan { .. } => "SCAN",
         }
     }
 }

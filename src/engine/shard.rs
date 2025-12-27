@@ -583,6 +583,11 @@ impl Shard {
     pub fn get_quota_mut(&mut self, key: &Key) -> Option<&mut QuotaEntry> {
         self.data.get_mut(key).and_then(|e| e.as_quota_mut())
     }
+
+    /// Get all keys in this shard.
+    pub fn keys(&self) -> impl Iterator<Item = &Key> {
+        self.data.keys()
+    }
 }
 
 #[cfg(test)]

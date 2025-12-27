@@ -50,6 +50,12 @@ impl Key {
         self.0.is_empty()
     }
 
+    /// Convert into the underlying Bytes
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
     /// Compute fast hash for shard routing using FxHash.
     ///
     /// FxHash is a fast, non-cryptographic hash function used by rustc.

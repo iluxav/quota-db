@@ -230,6 +230,30 @@ impl Handler {
                 let info = snapshot.to_info_string(section_str);
                 Frame::Bulk(bytes::Bytes::from(info))
             }
+            Command::Keys(pattern) => {
+                let keys = self.db.keys(&pattern);
+                let frames: Vec<Frame> = keys
+                    .into_iter()
+                    .map(|k| Frame::Bulk(k.into_bytes()))
+                    .collect();
+                Frame::Array(frames)
+            }
+            Command::Scan { cursor, pattern, count } => {
+                let (next_cursor, keys) = self.db.scan(
+                    cursor,
+                    pattern.as_deref(),
+                    count,
+                );
+                let key_frames: Vec<Frame> = keys
+                    .into_iter()
+                    .map(|k| Frame::Bulk(k.into_bytes()))
+                    .collect();
+                // SCAN returns [cursor, [keys...]]
+                Frame::Array(vec![
+                    Frame::Bulk(bytes::Bytes::from(next_cursor.to_string())),
+                    Frame::Array(key_frames),
+                ])
+            }
         }
     }
 

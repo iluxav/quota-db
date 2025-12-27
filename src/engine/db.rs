@@ -1,6 +1,126 @@
 use parking_lot::RwLock;
 
 use crate::config::Config;
+
+/// Simple glob pattern matching for Redis KEYS/SCAN commands.
+/// Supports: * (match any), ? (match single char), [...] (character class), \ (escape)
+fn glob_match(pattern: &str, text: &[u8]) -> bool {
+    let text_str = String::from_utf8_lossy(text);
+    glob_match_impl(pattern.as_bytes(), text_str.as_bytes())
+}
+
+fn glob_match_impl(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0; // pattern index
+    let mut ti = 0; // text index
+    let mut star_pi = None; // last * position in pattern
+    let mut star_ti = None; // text position when we hit *
+
+    while ti < text.len() {
+        if pi < pattern.len() {
+            match pattern[pi] {
+                b'*' => {
+                    // Match zero or more characters
+                    star_pi = Some(pi);
+                    star_ti = Some(ti);
+                    pi += 1;
+                    continue;
+                }
+                b'?' => {
+                    // Match exactly one character
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                b'\\' if pi + 1 < pattern.len() => {
+                    // Escaped character
+                    pi += 1;
+                    if pattern[pi] == text[ti] {
+                        pi += 1;
+                        ti += 1;
+                        continue;
+                    }
+                }
+                b'[' => {
+                    // Character class
+                    if let Some((matched, new_pi)) = match_char_class(&pattern[pi..], text[ti]) {
+                        if matched {
+                            pi = pi + new_pi;
+                            ti += 1;
+                            continue;
+                        }
+                    }
+                }
+                c if c == text[ti] => {
+                    // Exact match
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // No match - backtrack to last * if available
+        if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+            pi = spi + 1;
+            star_ti = Some(sti + 1);
+            ti = sti + 1;
+        } else {
+            return false;
+        }
+    }
+
+    // Check remaining pattern (should only be *s)
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
+}
+
+/// Match a character class like [abc] or [a-z] or [^abc]
+/// Returns (matched, bytes_consumed) or None if invalid
+fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
+    if pattern.is_empty() || pattern[0] != b'[' {
+        return None;
+    }
+
+    let mut i = 1;
+    let negated = if i < pattern.len() && pattern[i] == b'^' {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut matched = false;
+    let mut prev_char = None;
+
+    while i < pattern.len() && pattern[i] != b']' {
+        if pattern[i] == b'-' && prev_char.is_some() && i + 1 < pattern.len() && pattern[i + 1] != b']' {
+            // Range: a-z
+            let start = prev_char.unwrap();
+            let end = pattern[i + 1];
+            if ch >= start && ch <= end {
+                matched = true;
+            }
+            i += 2;
+            prev_char = Some(end);
+        } else {
+            if pattern[i] == ch {
+                matched = true;
+            }
+            prev_char = Some(pattern[i]);
+            i += 1;
+        }
+    }
+
+    if i < pattern.len() && pattern[i] == b']' {
+        Some((if negated { !matched } else { matched }, i + 1))
+    } else {
+        None // Unclosed bracket
+    }
+}
 use crate::engine::shard::QuotaResult;
 use crate::engine::Shard;
 use crate::persistence::{recover_shard, PersistenceConfig, PersistenceHandle};
@@ -238,6 +358,84 @@ impl ShardedDb {
     /// Get total entry count across all shards.
     pub fn total_entries(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
+    }
+
+    /// Get all keys matching a glob pattern.
+    /// Pattern supports: * (match any), ? (match single char), [...] (character class)
+    pub fn keys(&self, pattern: &[u8]) -> Vec<Key> {
+        let mut result = Vec::new();
+        let pattern_str = String::from_utf8_lossy(pattern);
+
+        for shard in &self.shards {
+            let shard_guard = shard.read();
+            for key in shard_guard.keys() {
+                if glob_match(&pattern_str, key.as_bytes()) {
+                    result.push(key.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Scan keys with cursor-based iteration.
+    /// Returns (next_cursor, keys) where next_cursor is 0 when scan is complete.
+    ///
+    /// The cursor encodes: (shard_index << 32) | position_within_shard
+    pub fn scan(
+        &self,
+        cursor: u64,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> (u64, Vec<Key>) {
+        let mut result = Vec::with_capacity(count);
+
+        // Decode cursor: high 32 bits = shard index, low 32 bits = position within shard
+        let mut shard_idx = (cursor >> 32) as usize;
+        let mut pos_in_shard = (cursor & 0xFFFFFFFF) as usize;
+
+        let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
+
+        while result.len() < count && shard_idx < self.num_shards {
+            let shard_guard = self.shards[shard_idx].read();
+            let keys: Vec<&Key> = shard_guard.keys().collect();
+
+            // Skip to current position
+            for key in keys.iter().skip(pos_in_shard) {
+                let matches = match &pattern_str {
+                    Some(pat) => glob_match(pat, key.as_bytes()),
+                    None => true,
+                };
+
+                if matches {
+                    result.push((*key).clone());
+                    if result.len() >= count {
+                        // Return cursor pointing to next position
+                        pos_in_shard += 1;
+                        let next_cursor = if pos_in_shard >= keys.len() {
+                            // Move to next shard
+                            let next_shard = shard_idx + 1;
+                            if next_shard >= self.num_shards {
+                                0 // Scan complete
+                            } else {
+                                (next_shard as u64) << 32
+                            }
+                        } else {
+                            ((shard_idx as u64) << 32) | (pos_in_shard as u64)
+                        };
+                        return (next_cursor, result);
+                    }
+                }
+                pos_in_shard += 1;
+            }
+
+            // Move to next shard
+            shard_idx += 1;
+            pos_in_shard = 0;
+        }
+
+        // Scan complete
+        (0, result)
     }
 
     /// Get per-shard entry counts (for metrics).
@@ -591,6 +789,137 @@ mod tests {
         // Verify all keys have the same values
         for (key, expected_value) in key_values {
             assert_eq!(db2.get(&key), Some(expected_value));
+        }
+    }
+
+    // ========== Glob Pattern Matching Tests ==========
+
+    #[test]
+    fn test_glob_match_star() {
+        assert!(super::glob_match("*", b"anything"));
+        assert!(super::glob_match("*", b""));
+        assert!(super::glob_match("foo*", b"foobar"));
+        assert!(super::glob_match("*bar", b"foobar"));
+        assert!(super::glob_match("foo*bar", b"fooXXXbar"));
+        assert!(!super::glob_match("foo*", b"barfoo"));
+    }
+
+    #[test]
+    fn test_glob_match_question() {
+        assert!(super::glob_match("?", b"a"));
+        assert!(!super::glob_match("?", b""));
+        assert!(!super::glob_match("?", b"ab"));
+        assert!(super::glob_match("fo?", b"foo"));
+        assert!(super::glob_match("f??", b"foo"));
+    }
+
+    #[test]
+    fn test_glob_match_char_class() {
+        assert!(super::glob_match("[abc]", b"a"));
+        assert!(super::glob_match("[abc]", b"b"));
+        assert!(!super::glob_match("[abc]", b"d"));
+        assert!(super::glob_match("[a-z]", b"m"));
+        assert!(!super::glob_match("[a-z]", b"5"));
+        assert!(super::glob_match("[^abc]", b"d"));
+        assert!(!super::glob_match("[^abc]", b"a"));
+    }
+
+    #[test]
+    fn test_glob_match_complex() {
+        assert!(super::glob_match("user:*:count", b"user:123:count"));
+        assert!(super::glob_match("user:[0-9]*", b"user:12345"));
+        assert!(super::glob_match("key_?_*", b"key_1_value"));
+    }
+
+    // ========== KEYS and SCAN Tests ==========
+
+    #[test]
+    fn test_keys_all() {
+        let db = create_db();
+
+        // Add some keys
+        for i in 0..10 {
+            let key = Key::from(format!("key_{}", i));
+            let _ = db.increment(key, 1);
+        }
+
+        // KEYS * should return all keys
+        let keys = db.keys(b"*");
+        assert_eq!(keys.len(), 10);
+    }
+
+    #[test]
+    fn test_keys_pattern() {
+        let db = create_db();
+
+        // Add mixed keys
+        let _ = db.increment(Key::from("user:1"), 1);
+        let _ = db.increment(Key::from("user:2"), 1);
+        let _ = db.increment(Key::from("post:1"), 1);
+        let _ = db.increment(Key::from("post:2"), 1);
+
+        let user_keys = db.keys(b"user:*");
+        assert_eq!(user_keys.len(), 2);
+
+        let post_keys = db.keys(b"post:*");
+        assert_eq!(post_keys.len(), 2);
+
+        let all_1_keys = db.keys(b"*:1");
+        assert_eq!(all_1_keys.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_basic() {
+        let db = create_db();
+
+        // Add some keys
+        for i in 0..20 {
+            let key = Key::from(format!("key_{}", i));
+            let _ = db.increment(key, 1);
+        }
+
+        // Scan with count 5
+        let mut all_keys = Vec::new();
+        let mut cursor = 0u64;
+
+        loop {
+            let (next_cursor, keys) = db.scan(cursor, None, 5);
+            all_keys.extend(keys);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(all_keys.len(), 20);
+    }
+
+    #[test]
+    fn test_scan_with_pattern() {
+        let db = create_db();
+
+        // Add mixed keys
+        for i in 0..10 {
+            let _ = db.increment(Key::from(format!("user:{}", i)), 1);
+            let _ = db.increment(Key::from(format!("post:{}", i)), 1);
+        }
+
+        // Scan only user:* keys
+        let mut user_keys = Vec::new();
+        let mut cursor = 0u64;
+
+        loop {
+            let (next_cursor, keys) = db.scan(cursor, Some(b"user:*"), 100);
+            user_keys.extend(keys);
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(user_keys.len(), 10);
+        for key in &user_keys {
+            assert!(key.as_bytes().starts_with(b"user:"));
         }
     }
 }
