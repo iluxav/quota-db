@@ -1,4 +1,5 @@
 use crate::engine::ShardedDb;
+use crate::metrics::{ReplicationLagMetrics, METRICS};
 use crate::replication::{AntiEntropyConfig, AntiEntropyTask, Delta, Message, PeerConnection, PeerConnectionReader, PeerConnectionWriter, PeerState};
 use crate::types::NodeId;
 use std::collections::HashMap;
@@ -187,6 +188,9 @@ impl ReplicationManager {
             .unwrap_or(Duration::from_secs(5));
         let mut anti_entropy_interval = interval(ae_interval);
 
+        // Metrics update interval (1 second)
+        let mut metrics_interval = interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
                 // Receive deltas from shards
@@ -279,6 +283,11 @@ impl ReplicationManager {
                     }
                 }
 
+                // Update metrics periodically
+                _ = metrics_interval.tick() => {
+                    self.update_lag_metrics();
+                }
+
                 // Handle disconnections
                 Some(addr) = disconnect_rx.recv() => {
                     info!("Peer {} disconnected, removing writer", addr);
@@ -316,6 +325,39 @@ impl ReplicationManager {
         }
     }
 
+    /// Update replication lag metrics
+    fn update_lag_metrics(&self) {
+        let head_seqs: Vec<u64> = if let Some(ref db) = self.db {
+            (0..self.config.num_shards)
+                .map(|i| db.shard_head_seq(i))
+                .collect()
+        } else {
+            return;
+        };
+
+        let mut max_lag = 0u64;
+        let mut total_lag = 0u64;
+        let mut per_peer = Vec::new();
+
+        for (addr, peer) in &self.outbound_peers {
+            if peer.state == crate::replication::ConnectionState::Connected {
+                let peer_max = peer.max_lag(&head_seqs);
+                let peer_total = peer.total_lag(&head_seqs);
+                max_lag = max_lag.max(peer_max);
+                total_lag += peer_total;
+                per_peer.push((addr.to_string(), peer_max));
+            }
+        }
+
+        let peer_count = per_peer.len();
+        METRICS.update_replication_lag(ReplicationLagMetrics {
+            max_lag,
+            total_lag,
+            peer_count,
+            per_peer,
+        });
+    }
+
     /// Handle a message from a peer
     /// Returns response messages to send back
     fn handle_peer_message(&mut self, addr: SocketAddr, msg: Message) -> Vec<Message> {
@@ -324,6 +366,11 @@ impl ReplicationManager {
                 if let Some(peer) = self.outbound_peers.get_mut(&addr) {
                     peer.update_acked(shard_id, acked_seq);
                     debug!("Peer {} acked shard {} seq {}", addr, shard_id, acked_seq);
+
+                    // Calculate and record RTT
+                    if let Some(rtt_us) = peer.calculate_rtt_on_ack() {
+                        METRICS.record_replication_rtt(rtt_us);
+                    }
                 }
                 vec![]
             }
@@ -472,6 +519,7 @@ impl ReplicationManager {
 
             // Send batches to the peer
             if let Some(writer) = self.writers.get_mut(&addr) {
+                let mut sent = false;
                 for (shard_id, shard_deltas) in by_shard {
                     let msg = Message::delta_batch(shard_id, shard_deltas);
                     if let Err(e) = writer.send(&msg).await {
@@ -483,8 +531,15 @@ impl ReplicationManager {
                         }
                         break;
                     } else {
+                        sent = true;
                         debug!("Sent {} deltas to {} for shard {}",
                                msg.delta_count(), addr, shard_id);
+                    }
+                }
+                // Mark batch sent for RTT tracking
+                if sent {
+                    if let Some(peer) = self.outbound_peers.get_mut(&addr) {
+                        peer.mark_batch_sent();
                     }
                 }
             }

@@ -5,6 +5,7 @@ use tracing::{error, info};
 
 use crate::config::Config;
 use crate::engine::ShardedDb;
+use crate::metrics::METRICS;
 use crate::replication::ReplicationHandle;
 use crate::server::{Connection, Handler};
 
@@ -58,6 +59,8 @@ impl Listener {
             let replication = self.replication.clone();
 
             tokio::spawn(async move {
+                METRICS.connection_opened();
+
                 let connection = Connection::new(socket);
                 let mut handler = if let Some(rep) = replication {
                     Handler::with_replication(connection, db, rep)
@@ -69,6 +72,7 @@ impl Listener {
                     error!("Connection error from {}: {}", addr, e);
                 }
 
+                METRICS.connection_closed();
                 // Permit is dropped here, releasing the semaphore
                 drop(permit);
             });

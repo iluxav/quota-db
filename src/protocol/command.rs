@@ -51,6 +51,9 @@ pub enum Command {
 
     /// FLUSHDB/FLUSHALL - stub for compatibility
     Flush,
+
+    /// INFO [section] - return server statistics
+    Info(Option<Bytes>),
 }
 
 impl Command {
@@ -152,6 +155,14 @@ impl Command {
             }
             b"DBSIZE" => Ok(Command::DbSize),
             b"FLUSHDB" | b"FLUSHALL" => Ok(Command::Flush),
+            b"INFO" => {
+                let section = if array.len() > 1 {
+                    Self::extract_bytes(&array, 1).ok()
+                } else {
+                    None
+                };
+                Ok(Command::Info(section))
+            }
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd_name);
                 Err(Error::UnknownCommand(cmd_str.to_string()))
@@ -230,6 +241,7 @@ impl Command {
             Command::ConfigSet => "CONFIG SET",
             Command::DbSize => "DBSIZE",
             Command::Flush => "FLUSH",
+            Command::Info(_) => "INFO",
         }
     }
 }

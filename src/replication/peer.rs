@@ -30,6 +30,8 @@ pub struct PeerState {
     pub state: ConnectionState,
     /// Reconnect backoff
     pub backoff: Duration,
+    /// Timestamp when last batch was sent (for RTT calculation)
+    pub last_batch_sent: Option<Instant>,
 }
 
 impl PeerState {
@@ -43,6 +45,7 @@ impl PeerState {
             last_flush: Instant::now(),
             state: ConnectionState::Disconnected,
             backoff: Duration::from_millis(100),
+            last_batch_sent: None,
         }
     }
 
@@ -87,6 +90,46 @@ impl PeerState {
     pub fn increase_backoff(&mut self) {
         self.backoff = (self.backoff * 2).min(Duration::from_secs(10));
         self.state = ConnectionState::Disconnected;
+    }
+
+    /// Mark that a batch was sent (for RTT calculation)
+    pub fn mark_batch_sent(&mut self) {
+        self.last_batch_sent = Some(Instant::now());
+    }
+
+    /// Calculate RTT if we have a pending batch and received an ACK
+    /// Returns the RTT in microseconds if calculable
+    pub fn calculate_rtt_on_ack(&mut self) -> Option<u64> {
+        if let Some(sent_at) = self.last_batch_sent.take() {
+            Some(sent_at.elapsed().as_micros() as u64)
+        } else {
+            None
+        }
+    }
+
+    /// Calculate max lag across all shards given the local head sequences
+    pub fn max_lag(&self, head_seqs: &[u64]) -> u64 {
+        let mut max_lag = 0u64;
+        for (shard_id, &head_seq) in head_seqs.iter().enumerate() {
+            if shard_id < self.acked_seq.len() {
+                let acked = self.acked_seq[shard_id];
+                let lag = head_seq.saturating_sub(acked);
+                max_lag = max_lag.max(lag);
+            }
+        }
+        max_lag
+    }
+
+    /// Calculate total lag across all shards
+    pub fn total_lag(&self, head_seqs: &[u64]) -> u64 {
+        let mut total = 0u64;
+        for (shard_id, &head_seq) in head_seqs.iter().enumerate() {
+            if shard_id < self.acked_seq.len() {
+                let acked = self.acked_seq[shard_id];
+                total += head_seq.saturating_sub(acked);
+            }
+        }
+        total
     }
 }
 

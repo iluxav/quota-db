@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quota_db::config::Config;
 use quota_db::engine::ShardedDb;
+use quota_db::metrics::METRICS;
 use quota_db::persistence::PersistenceManager;
 use quota_db::replication::{ReplicationConfig, ReplicationManager};
 use quota_db::server::Listener;
@@ -30,6 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
+
+    // Initialize metrics
+    METRICS.init_start_time();
 
     info!("QuotaDB v{}", env!("CARGO_PKG_VERSION"));
     info!(

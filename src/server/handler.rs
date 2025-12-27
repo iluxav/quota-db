@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::engine::{QuotaResult, ShardedDb};
 use crate::error::Result;
+use crate::metrics::{CommandType, METRICS};
 use crate::protocol::{Command, Frame};
 use crate::replication::ReplicationHandle;
 use crate::server::Connection;
@@ -63,11 +65,35 @@ impl Handler {
     /// Process a single frame and return the response.
     fn process_frame(&self, frame: Frame) -> Frame {
         match Command::from_frame(frame.clone()) {
-            Ok(cmd) => self.execute_command(cmd),
+            Ok(cmd) => {
+                let start = Instant::now();
+                let cmd_type = Self::command_type(&cmd);
+                let response = self.execute_command(cmd);
+                METRICS.record_command(cmd_type, start);
+                response
+            }
             Err(e) => {
                 tracing::debug!("Command parse error: {} for frame: {:?}", e, frame);
+                METRICS.inc(&METRICS.errors_parse);
                 Frame::error(format!("ERR {}", e))
             }
+        }
+    }
+
+    /// Map a command to its metrics type.
+    #[inline]
+    fn command_type(cmd: &Command) -> CommandType {
+        match cmd {
+            Command::Incr(_) | Command::IncrBy(_, _) => CommandType::Incr,
+            Command::Decr(_) | Command::DecrBy(_, _) => CommandType::Decr,
+            Command::Get(_) => CommandType::Get,
+            Command::Set(_, _) => CommandType::Set,
+            Command::Ping(_) => CommandType::Ping,
+            Command::Info(_) => CommandType::Info,
+            Command::QuotaSet(_, _, _)
+            | Command::QuotaGet(_)
+            | Command::QuotaDel(_) => CommandType::Quota,
+            _ => CommandType::Other,
         }
     }
 
@@ -195,6 +221,14 @@ impl Handler {
             Command::Flush => {
                 // No-op for now (counter db doesn't support flush)
                 Frame::ok()
+            }
+            Command::Info(section) => {
+                let section_str = section
+                    .as_ref()
+                    .map(|b| std::str::from_utf8(b).unwrap_or(""));
+                let snapshot = METRICS.snapshot();
+                let info = snapshot.to_info_string(section_str);
+                Frame::Bulk(bytes::Bytes::from(info))
             }
         }
     }
