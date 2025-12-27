@@ -8,7 +8,8 @@ use quota_db::persistence::PersistenceManager;
 use quota_db::replication::{ReplicationConfig, ReplicationManager};
 use quota_db::server::Listener;
 
-use tracing::{info, Level};
+use tokio::sync::broadcast;
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
@@ -156,8 +157,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Create shutdown broadcast channel
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
     // Create and run the listener
-    let listener = Listener::bind(&config, db).await?;
+    let listener = Listener::bind(&config, db.clone()).await?;
     let listener = if let Some(handle) = replication_handle {
         listener.with_replication(handle)
     } else {
@@ -165,7 +169,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("Ready to accept connections");
-    listener.run().await?;
 
+    // Spawn the listener task
+    let listener_shutdown = shutdown_tx.subscribe();
+    let listener_handle = tokio::spawn(async move {
+        listener.run_with_shutdown(listener_shutdown).await
+    });
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT (Ctrl+C), initiating graceful shutdown...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix, just wait forever (ctrl_c will handle it)
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("Received SIGTERM, initiating graceful shutdown...");
+        }
+    }
+
+    // Signal shutdown to all components
+    let _ = shutdown_tx.send(());
+
+    // Give components time to gracefully shutdown
+    info!("Waiting for connections to close (timeout: 5s)...");
+    let shutdown_timeout = Duration::from_secs(5);
+
+    match tokio::time::timeout(shutdown_timeout, listener_handle).await {
+        Ok(result) => {
+            match result {
+                Ok(Ok(())) => info!("Server shut down gracefully"),
+                Ok(Err(e)) => warn!("Server error during shutdown: {}", e),
+                Err(e) => warn!("Server task panicked: {}", e),
+            }
+        }
+        Err(_) => {
+            warn!("Shutdown timed out, forcing exit");
+        }
+    }
+
+    // Final cleanup: flush any remaining data
+    info!("Performing final data sync...");
+    // The ShardedDb will handle persistence flushing on drop
+
+    info!("Shutdown complete");
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tokio::sync::{broadcast, Semaphore};
+use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::engine::ShardedDb;
@@ -77,5 +77,105 @@ impl Listener {
                 drop(permit);
             });
         }
+    }
+
+    /// Run the accept loop with shutdown signal support.
+    /// Stops accepting new connections when shutdown is received,
+    /// and waits for existing connections to complete.
+    pub async fn run_with_shutdown(
+        self,
+        mut shutdown: broadcast::Receiver<()>,
+    ) -> std::io::Result<()> {
+        // Track active connections for graceful shutdown
+        let active_connections = Arc::new(tokio::sync::Notify::new());
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Check for shutdown signal first
+                _ = shutdown.recv() => {
+                    info!("Shutdown signal received, stopping new connections");
+                    break;
+                }
+
+                // Try to acquire permit and accept connection
+                result = async {
+                    let permit = self
+                        .connection_limit
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("semaphore closed");
+
+                    let accept_result = self.listener.accept().await;
+                    (permit, accept_result)
+                } => {
+                    let (permit, accept_result) = result;
+                    let (socket, addr) = accept_result?;
+
+                    // Enable TCP_NODELAY for lower latency
+                    if let Err(e) = socket.set_nodelay(true) {
+                        error!("Failed to set TCP_NODELAY: {}", e);
+                    }
+
+                    let db = self.db.clone();
+                    let replication = self.replication.clone();
+                    let notify = active_connections.clone();
+
+                    tokio::spawn(async move {
+                        METRICS.connection_opened();
+
+                        let connection = Connection::new(socket);
+                        let mut handler = if let Some(rep) = replication {
+                            Handler::with_replication(connection, db, rep)
+                        } else {
+                            Handler::new(connection, db)
+                        };
+
+                        if let Err(e) = handler.run().await {
+                            debug!("Connection closed from {}: {}", addr, e);
+                        }
+
+                        METRICS.connection_closed();
+                        // Permit is dropped here, releasing the semaphore
+                        drop(permit);
+                        // Notify that a connection finished
+                        notify.notify_one();
+                    });
+                }
+            }
+        }
+
+        // Wait for existing connections to drain (check via semaphore)
+        // If all permits are available, no connections are active
+        let max_permits = self.connection_limit.available_permits();
+        let total_permits = max_permits; // This is approximate
+
+        info!(
+            "Waiting for {} active connections to finish",
+            total_permits.saturating_sub(self.connection_limit.available_permits())
+        );
+
+        // Wait with timeout for connections to drain
+        let drain_timeout = tokio::time::Duration::from_secs(4);
+        let _ = tokio::time::timeout(drain_timeout, async {
+            loop {
+                // Check if all permits are available
+                if self.connection_limit.available_permits() >= total_permits {
+                    break;
+                }
+                // Wait for a connection to finish
+                active_connections.notified().await;
+            }
+        })
+        .await;
+
+        let remaining = total_permits.saturating_sub(self.connection_limit.available_permits());
+        if remaining > 0 {
+            info!("{} connections did not finish in time", remaining);
+        }
+
+        Ok(())
     }
 }

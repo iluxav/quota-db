@@ -87,6 +87,15 @@ pub enum WalOp {
     },
 }
 
+/// Maximum retries for transient sync failures
+const MAX_SYNC_RETRIES: u32 = 3;
+
+/// Delay between sync retries (exponential backoff base)
+const SYNC_RETRY_BASE_DELAY_MS: u64 = 10;
+
+/// Maximum consecutive sync failures before degraded state
+const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 10;
+
 /// Writer for append-only WAL file.
 pub struct WalWriter {
     writer: BufWriter<File>,
@@ -96,6 +105,12 @@ pub struct WalWriter {
     pending_bytes: usize,
     last_sync: Instant,
     sync_ops_threshold: usize,
+    /// Consecutive sync failures (for degraded mode detection)
+    consecutive_sync_failures: u32,
+    /// Total sync failures (for metrics)
+    total_sync_failures: u64,
+    /// Is the WAL in degraded mode (too many consecutive failures)
+    degraded: bool,
 }
 
 impl WalWriter {
@@ -132,6 +147,9 @@ impl WalWriter {
             pending_bytes: 0,
             last_sync: Instant::now(),
             sync_ops_threshold,
+            consecutive_sync_failures: 0,
+            total_sync_failures: 0,
+            degraded: false,
         })
     }
 
@@ -166,14 +184,99 @@ impl WalWriter {
             || self.last_sync.elapsed() >= interval
     }
 
-    /// Flush buffer and sync to disk.
+    /// Flush buffer and sync to disk with retry logic for transient failures.
     pub fn sync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        self.pending_count = 0;
-        self.pending_bytes = 0;
-        self.last_sync = Instant::now();
-        Ok(())
+        // Skip if no pending data
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+
+        let mut last_error = None;
+
+        for attempt in 0..MAX_SYNC_RETRIES {
+            // Flush buffer first
+            if let Err(e) = self.writer.flush() {
+                if Self::is_transient_error(&e) && attempt < MAX_SYNC_RETRIES - 1 {
+                    last_error = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        SYNC_RETRY_BASE_DELAY_MS << attempt,
+                    ));
+                    continue;
+                }
+                return self.handle_sync_failure(e);
+            }
+
+            // Sync to disk
+            if let Err(e) = self.writer.get_ref().sync_data() {
+                if Self::is_transient_error(&e) && attempt < MAX_SYNC_RETRIES - 1 {
+                    last_error = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        SYNC_RETRY_BASE_DELAY_MS << attempt,
+                    ));
+                    continue;
+                }
+                return self.handle_sync_failure(e);
+            }
+
+            // Success - reset failure counters
+            self.pending_count = 0;
+            self.pending_bytes = 0;
+            self.last_sync = Instant::now();
+            self.consecutive_sync_failures = 0;
+            if self.degraded {
+                self.degraded = false;
+                // Log recovery from degraded state
+            }
+            return Ok(());
+        }
+
+        // All retries exhausted
+        self.handle_sync_failure(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "sync failed after retries")
+        }))
+    }
+
+    /// Check if an error is transient and worth retrying
+    fn is_transient_error(e: &io::Error) -> bool {
+        matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+        )
+    }
+
+    /// Handle a sync failure - track metrics and potentially enter degraded mode
+    fn handle_sync_failure(&mut self, e: io::Error) -> io::Result<()> {
+        self.consecutive_sync_failures += 1;
+        self.total_sync_failures += 1;
+
+        if self.consecutive_sync_failures >= MAX_CONSECUTIVE_SYNC_FAILURES && !self.degraded {
+            self.degraded = true;
+        }
+
+        Err(e)
+    }
+
+    /// Check if the WAL is in degraded mode (too many consecutive sync failures)
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Get the total number of sync failures since startup
+    pub fn total_sync_failures(&self) -> u64 {
+        self.total_sync_failures
+    }
+
+    /// Get the number of consecutive sync failures
+    pub fn consecutive_sync_failures(&self) -> u32 {
+        self.consecutive_sync_failures
+    }
+
+    /// Reset degraded state (call after recovering from disk issues)
+    pub fn reset_degraded(&mut self) {
+        self.degraded = false;
+        self.consecutive_sync_failures = 0;
     }
 
     /// Get pending byte count (for snapshot trigger).

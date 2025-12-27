@@ -54,6 +54,8 @@ pub struct Metrics {
     pub snapshots_created: AtomicU64,
     /// WAL entries dropped due to backpressure
     pub wal_dropped: AtomicU64,
+    /// WAL sync failures (includes retries)
+    pub wal_sync_failures: AtomicU64,
 
     // Latency histograms (stored separately for each command type)
     pub latency_incr: LatencyHistogram,
@@ -115,6 +117,7 @@ impl Metrics {
             wal_bytes_written: AtomicU64::new(0),
             snapshots_created: AtomicU64::new(0),
             wal_dropped: AtomicU64::new(0),
+            wal_sync_failures: AtomicU64::new(0),
 
             latency_incr: LatencyHistogram::new(),
             latency_decr: LatencyHistogram::new(),
@@ -275,6 +278,7 @@ impl Metrics {
             wal_bytes_written: self.wal_bytes_written.load(RELAXED),
             snapshots_created: self.snapshots_created.load(RELAXED),
             wal_dropped: self.wal_dropped.load(RELAXED),
+            wal_sync_failures: self.wal_sync_failures.load(RELAXED),
 
             latency_incr: self.latency_incr.percentiles(),
             latency_decr: self.latency_decr.percentiles(),
@@ -346,6 +350,7 @@ pub struct MetricsSnapshot {
     pub wal_bytes_written: u64,
     pub snapshots_created: u64,
     pub wal_dropped: u64,
+    pub wal_sync_failures: u64,
 
     pub latency_incr: LatencyPercentiles,
     pub latency_decr: LatencyPercentiles,
@@ -500,6 +505,7 @@ impl MetricsSnapshot {
                 self.snapshots_created
             ));
             out.push_str(&format!("wal_dropped:{}\r\n", self.wal_dropped));
+            out.push_str(&format!("wal_sync_failures:{}\r\n", self.wal_sync_failures));
             out.push_str("\r\n");
         }
 

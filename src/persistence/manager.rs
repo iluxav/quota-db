@@ -229,7 +229,15 @@ impl PersistenceManager {
                 // Check if we should sync based on ops threshold
                 if writer.should_sync(self.config.wal_sync_interval) {
                     if let Err(e) = writer.sync() {
-                        warn!("Failed to sync WAL for shard {}: {}", shard_id, e);
+                        METRICS.inc(&METRICS.wal_sync_failures);
+                        if writer.is_degraded() {
+                            warn!(
+                                "WAL for shard {} entered degraded mode after {} consecutive failures: {}",
+                                shard_id, writer.consecutive_sync_failures(), e
+                            );
+                        } else {
+                            warn!("Failed to sync WAL for shard {}: {}", shard_id, e);
+                        }
                     } else {
                         self.last_sync[shard_id] = Instant::now();
                     }
@@ -244,7 +252,15 @@ impl PersistenceManager {
             if let Some(ref mut writer) = *writer_guard {
                 if self.last_sync[shard_id].elapsed() >= self.config.wal_sync_interval {
                     if let Err(e) = writer.sync() {
-                        warn!("Failed to sync WAL for shard {}: {}", shard_id, e);
+                        METRICS.inc(&METRICS.wal_sync_failures);
+                        if writer.is_degraded() {
+                            warn!(
+                                "WAL for shard {} entered degraded mode after {} consecutive failures: {}",
+                                shard_id, writer.consecutive_sync_failures(), e
+                            );
+                        } else {
+                            warn!("Failed to sync WAL for shard {}: {}", shard_id, e);
+                        }
                     } else {
                         self.last_sync[shard_id] = Instant::now();
                     }

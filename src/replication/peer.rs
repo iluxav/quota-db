@@ -13,7 +13,15 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// Circuit breaker is open - not attempting connections
+    CircuitOpen,
 }
+
+/// Maximum consecutive failures before opening circuit breaker
+const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// Cool-off period when circuit breaker is open
+const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(60);
 
 /// Peer node state for replication
 pub struct PeerState {
@@ -33,6 +41,10 @@ pub struct PeerState {
     pub backoff: Duration,
     /// Timestamp when last batch was sent (for RTT calculation)
     pub last_batch_sent: Option<Instant>,
+    /// Consecutive connection failures (for circuit breaker)
+    pub consecutive_failures: u32,
+    /// When circuit breaker opened (for cool-off timing)
+    pub circuit_opened_at: Option<Instant>,
 }
 
 impl PeerState {
@@ -47,6 +59,8 @@ impl PeerState {
             state: ConnectionState::Disconnected,
             backoff: Duration::from_millis(100),
             last_batch_sent: None,
+            consecutive_failures: 0,
+            circuit_opened_at: None,
         }
     }
 
@@ -85,12 +99,56 @@ impl PeerState {
     pub fn reset_backoff(&mut self) {
         self.backoff = Duration::from_millis(100);
         self.state = ConnectionState::Connected;
+        self.consecutive_failures = 0;
+        self.circuit_opened_at = None;
     }
 
-    /// Increase backoff on connection failure
-    pub fn increase_backoff(&mut self) {
+    /// Increase backoff on connection failure.
+    /// Returns true if circuit breaker was opened.
+    pub fn increase_backoff(&mut self) -> bool {
+        self.consecutive_failures += 1;
         self.backoff = (self.backoff * 2).min(Duration::from_secs(10));
-        self.state = ConnectionState::Disconnected;
+
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            self.state = ConnectionState::CircuitOpen;
+            self.circuit_opened_at = Some(Instant::now());
+            true
+        } else {
+            self.state = ConnectionState::Disconnected;
+            false
+        }
+    }
+
+    /// Check if the circuit breaker allows a connection attempt.
+    /// Returns true if we can attempt to connect.
+    pub fn can_attempt_connection(&self) -> bool {
+        match self.state {
+            ConnectionState::Disconnected => true,
+            ConnectionState::CircuitOpen => {
+                // Check if cool-off period has elapsed
+                if let Some(opened_at) = self.circuit_opened_at {
+                    opened_at.elapsed() >= CIRCUIT_OPEN_DURATION
+                } else {
+                    true
+                }
+            }
+            ConnectionState::Connecting | ConnectionState::Connected => false,
+        }
+    }
+
+    /// Reset circuit breaker after cool-off period.
+    /// Call this when attempting a new connection after circuit was open.
+    pub fn half_open_circuit(&mut self) {
+        if self.state == ConnectionState::CircuitOpen {
+            // Move to "half-open" state - will fully close on success, reopen on failure
+            self.state = ConnectionState::Connecting;
+            // Keep failure count for now - will reset on success
+        }
+    }
+
+    /// Check if circuit breaker is currently open
+    pub fn is_circuit_open(&self) -> bool {
+        self.state == ConnectionState::CircuitOpen
     }
 
     /// Mark that a batch was sent (for RTT calculation)
@@ -348,5 +406,62 @@ mod tests {
 
         state.reset_backoff();
         assert_eq!(state.backoff, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_circuit_breaker() {
+        let addr: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+        let mut state = PeerState::new(addr, 64);
+
+        assert!(state.can_attempt_connection());
+        assert!(!state.is_circuit_open());
+
+        // Fail MAX_CONSECUTIVE_FAILURES - 1 times, should not open circuit
+        for _ in 0..(MAX_CONSECUTIVE_FAILURES - 1) {
+            let opened = state.increase_backoff();
+            assert!(!opened);
+            assert!(!state.is_circuit_open());
+        }
+
+        // One more failure should open the circuit
+        let opened = state.increase_backoff();
+        assert!(opened);
+        assert!(state.is_circuit_open());
+        assert!(!state.can_attempt_connection()); // Circuit is open, can't connect
+
+        // Successful connection should reset everything
+        state.reset_backoff();
+        assert!(!state.is_circuit_open());
+        // After reset, state is Connected, so can_attempt_connection returns false
+        // (we don't want to attempt a connection when already connected)
+        assert!(!state.can_attempt_connection());
+        assert_eq!(state.state, ConnectionState::Connected);
+        assert_eq!(state.consecutive_failures, 0);
+
+        // After disconnection, should be able to attempt connection again
+        state.state = ConnectionState::Disconnected;
+        assert!(state.can_attempt_connection());
+    }
+
+    #[test]
+    fn test_circuit_half_open() {
+        let addr: SocketAddr = "127.0.0.1:6381".parse().unwrap();
+        let mut state = PeerState::new(addr, 64);
+
+        // Open the circuit
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            state.increase_backoff();
+        }
+        assert!(state.is_circuit_open());
+
+        // Half-open the circuit (simulating retry after cool-off)
+        state.half_open_circuit();
+        assert_eq!(state.state, ConnectionState::Connecting);
+        assert!(!state.is_circuit_open());
+
+        // If connection fails again, circuit should reopen immediately
+        let opened = state.increase_backoff();
+        assert!(opened);
+        assert!(state.is_circuit_open());
     }
 }

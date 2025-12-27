@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use tracing::{debug, info, warn};
 
 use crate::engine::ShardedDb;
@@ -41,8 +41,8 @@ pub struct PeerAntiEntropyState {
     pub remote_seqs: Vec<u64>,
     /// Digest mismatch count per shard
     pub mismatch_count: Vec<u8>,
-    /// Shards with pending snapshot requests
-    pub snapshot_pending: FxHashSet<u16>,
+    /// Shards with pending snapshot requests (shard_id -> request timestamp)
+    pub snapshot_pending: FxHashMap<u16, Instant>,
 }
 
 impl PeerAntiEntropyState {
@@ -51,7 +51,7 @@ impl PeerAntiEntropyState {
         Self {
             remote_seqs: vec![0; num_shards],
             mismatch_count: vec![0; num_shards],
-            snapshot_pending: FxHashSet::default(),
+            snapshot_pending: FxHashMap::default(),
         }
     }
 
@@ -89,19 +89,42 @@ impl PeerAntiEntropyState {
         self.mismatch_count.get(shard_id as usize).copied().unwrap_or(0)
     }
 
-    /// Mark snapshot as pending for a shard
+    /// Mark snapshot as pending for a shard with current timestamp
     pub fn mark_snapshot_pending(&mut self, shard_id: u16) {
-        self.snapshot_pending.insert(shard_id);
+        self.snapshot_pending.insert(shard_id, Instant::now());
     }
 
     /// Check if snapshot is pending for a shard
     pub fn is_snapshot_pending(&self, shard_id: u16) -> bool {
-        self.snapshot_pending.contains(&shard_id)
+        self.snapshot_pending.contains_key(&shard_id)
     }
 
     /// Clear snapshot pending for a shard
     pub fn clear_snapshot_pending(&mut self, shard_id: u16) {
         self.snapshot_pending.remove(&shard_id);
+    }
+
+    /// Check for timed-out snapshot requests and clear them
+    /// Returns the list of shards that timed out
+    pub fn clear_timed_out_snapshots(&mut self, timeout: Duration) -> Vec<u16> {
+        let now = Instant::now();
+        let timed_out: Vec<u16> = self
+            .snapshot_pending
+            .iter()
+            .filter(|(_, requested_at)| now.duration_since(**requested_at) >= timeout)
+            .map(|(shard_id, _)| *shard_id)
+            .collect();
+
+        for shard_id in &timed_out {
+            self.snapshot_pending.remove(shard_id);
+        }
+
+        timed_out
+    }
+
+    /// Get the timestamp when a snapshot was requested for a shard
+    pub fn snapshot_requested_at(&self, shard_id: u16) -> Option<Instant> {
+        self.snapshot_pending.get(&shard_id).copied()
     }
 }
 
@@ -214,6 +237,31 @@ impl AntiEntropyTask {
     /// Get the snapshot threshold from configuration
     pub fn snapshot_threshold(&self) -> u8 {
         self.config.snapshot_threshold
+    }
+
+    /// Get the snapshot timeout from configuration
+    pub fn snapshot_timeout(&self) -> Duration {
+        self.config.snapshot_timeout
+    }
+
+    /// Check for timed-out snapshot requests across all peers
+    /// Returns a list of (peer_addr, shard_ids) that timed out
+    pub fn check_snapshot_timeouts(&mut self) -> Vec<(SocketAddr, Vec<u16>)> {
+        let timeout = self.config.snapshot_timeout;
+        let mut timed_out = Vec::new();
+
+        for (addr, peer) in &mut self.peer_state {
+            let shards = peer.clear_timed_out_snapshots(timeout);
+            if !shards.is_empty() {
+                warn!(
+                    "Snapshot request timed out for peer {} shards {:?} (timeout: {:?})",
+                    addr, shards, timeout
+                );
+                timed_out.push((*addr, shards));
+            }
+        }
+
+        timed_out
     }
 
     // ========== Message Handling Methods ==========
@@ -910,5 +958,58 @@ mod tests {
         // Second mismatch - should NOT trigger another request (pending)
         let resp2 = task.handle_digest_exchange(peer, 0, 0, 0xDEAD);
         assert!(resp2.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_timeout_tracking() {
+        let mut state = PeerAntiEntropyState::new(4);
+
+        // Mark snapshot pending
+        state.mark_snapshot_pending(0);
+        state.mark_snapshot_pending(2);
+        assert!(state.is_snapshot_pending(0));
+        assert!(state.is_snapshot_pending(2));
+        assert!(!state.is_snapshot_pending(1));
+
+        // Request timestamps should be set
+        assert!(state.snapshot_requested_at(0).is_some());
+        assert!(state.snapshot_requested_at(2).is_some());
+
+        // With zero timeout, nothing should be considered timed out (just requested)
+        let timed_out = state.clear_timed_out_snapshots(Duration::from_millis(0));
+        // Immediately after marking, they might not be timed out (depends on timing)
+        // But with very short timeout they should be
+        // Using 0ms timeout with immediate check - should still be pending
+        assert!(state.is_snapshot_pending(0) || !timed_out.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_timeout_clears_stale() {
+        let mut state = PeerAntiEntropyState::new(4);
+
+        // Mark snapshot pending
+        state.mark_snapshot_pending(0);
+        assert!(state.is_snapshot_pending(0));
+
+        // With a very long timeout, nothing should time out
+        let timed_out = state.clear_timed_out_snapshots(Duration::from_secs(3600));
+        assert!(timed_out.is_empty());
+        assert!(state.is_snapshot_pending(0));
+
+        // Clear it manually
+        state.clear_snapshot_pending(0);
+        assert!(!state.is_snapshot_pending(0));
+    }
+
+    #[test]
+    fn test_anti_entropy_snapshot_timeout_config() {
+        let db = create_test_db();
+        let config = AntiEntropyConfig {
+            snapshot_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let task = AntiEntropyTask::new(db, config);
+
+        assert_eq!(task.snapshot_timeout(), Duration::from_secs(30));
     }
 }

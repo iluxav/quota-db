@@ -209,6 +209,9 @@ impl ReplicationManager {
         // Metrics update interval (1 second)
         let mut metrics_interval = interval(Duration::from_secs(1));
 
+        // Circuit breaker check interval (check if any circuits can be half-opened)
+        let mut circuit_check_interval = interval(Duration::from_secs(10));
+
         loop {
             tokio::select! {
                 // Receive deltas from shards
@@ -298,6 +301,26 @@ impl ReplicationManager {
                                 }
                             }
                         }
+
+                        // Check for timed-out snapshot requests and retry them
+                        let timed_out = ae.check_snapshot_timeouts();
+                        for (addr, shards) in timed_out {
+                            if let Some(writer) = self.writers.get_mut(&addr) {
+                                for shard_id in shards {
+                                    info!("Retrying snapshot request for shard {} to {}", shard_id, addr);
+                                    // Re-request the snapshot
+                                    let msg = Message::snapshot_request(shard_id);
+                                    if let Err(e) = writer.send(&msg).await {
+                                        warn!("Failed to retry snapshot request to {}: {}", addr, e);
+                                        break;
+                                    }
+                                    // Mark as pending again
+                                    if let Some(peer_state) = ae.peer_state_mut(&addr) {
+                                        peer_state.mark_snapshot_pending(shard_id);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -316,21 +339,58 @@ impl ReplicationManager {
                         ae.unregister_peer(addr);
                     }
 
-                    if let Some(peer) = self.outbound_peers.get_mut(&addr) {
-                        peer.state = crate::replication::ConnectionState::Disconnected;
-                        peer.increase_backoff();
+                    // Update peer state and check circuit breaker
+                    let should_reconnect = if let Some(peer) = self.outbound_peers.get_mut(&addr) {
+                        let circuit_opened = peer.increase_backoff();
+                        if circuit_opened {
+                            warn!("Circuit breaker opened for peer {} after {} consecutive failures",
+                                  addr, peer.consecutive_failures);
+                            false // Don't reconnect - circuit is open
+                        } else {
+                            true // Can attempt reconnection
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Only trigger reconnection if circuit is not open
+                    if should_reconnect {
+                        let conn_tx = conn_tx.clone();
+                        let reconnect_tx = reconnect_tx.clone();
+                        let backoff = self.outbound_peers.get(&addr)
+                            .map(|p| p.backoff)
+                            .unwrap_or(Duration::from_millis(100));
+                        tokio::spawn(async move {
+                            // Wait for backoff before attempting reconnection
+                            tokio::time::sleep(backoff).await;
+                            Self::connector_task(addr, conn_tx, reconnect_tx).await;
+                        });
                     }
-                    // Trigger reconnection
-                    let conn_tx = conn_tx.clone();
-                    let reconnect_tx = reconnect_tx.clone();
-                    tokio::spawn(async move {
-                        Self::connector_task(addr, conn_tx, reconnect_tx).await;
-                    });
                 }
 
                 // Handle reconnection requests (for future use)
                 Some(_addr) = reconnect_rx.recv() => {
                     // Reconnection is handled in disconnect handler
+                }
+
+                // Periodic circuit breaker check - retry peers with open circuits after cool-off
+                _ = circuit_check_interval.tick() => {
+                    for addr in self.config.peers.clone() {
+                        if let Some(peer) = self.outbound_peers.get_mut(&addr) {
+                            // Check if circuit is open but can now attempt connection (cool-off elapsed)
+                            if peer.is_circuit_open() && peer.can_attempt_connection() {
+                                info!("Circuit breaker cool-off elapsed for {}, attempting reconnection", addr);
+                                peer.half_open_circuit();
+
+                                // Spawn connector task
+                                let conn_tx = conn_tx.clone();
+                                let reconnect_tx = reconnect_tx.clone();
+                                tokio::spawn(async move {
+                                    Self::connector_task(addr, conn_tx, reconnect_tx).await;
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
