@@ -180,14 +180,11 @@ impl Handler {
                 Frame::integer(value)
             }
             Command::Set(key, value) => {
-                // Get shard_id and timestamp before set
-                let shard_id = (key.shard_hash() as u16) % 64; // Use same shard count as db
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                // Compute shard routing
+                let shard_id = (key.shard_hash() as u16) % 64;
 
-                self.db.set_string(key.clone(), value.clone());
+                // Set string and get timestamp (generated once in shard)
+                let timestamp = self.db.set_string_fast(shard_id, key.clone(), value.clone());
 
                 // Replicate to other nodes if replication is enabled
                 if let Some(ref handle) = self.replication {

@@ -285,13 +285,31 @@ impl ShardedDb {
         }
     }
 
+    /// Optimized SET path - shard_id pre-computed, returns timestamp for replication.
+    /// Avoids redundant shard_index computation and extra clones.
+    #[inline]
+    pub fn set_string_fast(&self, shard_id: u16, key: Key, value: Bytes) -> u64 {
+        let idx = shard_id as usize;
+        let timestamp = self.shards[idx].write().set_string_inline(key.clone(), value.clone());
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            let seq = self.shards[idx].read().head_seq();
+            handle.log_set_string(shard_id, seq, &key, &value, timestamp);
+        }
+
+        timestamp
+    }
+
     /// Get a string value for a key.
+    #[inline]
     pub fn get_string(&self, key: &Key) -> Option<Bytes> {
         let idx = self.shard_index(key);
         self.shards[idx].read().get_string(key).cloned()
     }
 
     /// Set a string value with a specific timestamp (for replication with LWW semantics).
+    #[inline]
     pub fn set_string_with_timestamp(&self, key: Key, value: Bytes, timestamp: u64) {
         let idx = self.shard_index(&key);
         self.shards[idx].write().set_string_with_timestamp(key, value, timestamp);

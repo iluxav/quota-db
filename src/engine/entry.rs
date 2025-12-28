@@ -50,13 +50,20 @@ impl StringEntry {
         self.timestamp
     }
 
-    /// Set the value with a new timestamp.
+    /// Set the value with a new timestamp (LWW check).
     pub fn set(&mut self, value: Bytes, timestamp: u64) {
         // LWW: only update if timestamp is newer
         if timestamp >= self.timestamp {
             self.value = value;
             self.timestamp = timestamp;
         }
+    }
+
+    /// Set the value directly without LWW check (for local writes where we know timestamp is current).
+    #[inline]
+    pub fn set_inline(&mut self, value: Bytes, timestamp: u64) {
+        self.value = value;
+        self.timestamp = timestamp;
     }
 
     /// Merge with another string entry (LWW: keep the one with higher timestamp).

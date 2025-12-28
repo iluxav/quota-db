@@ -225,16 +225,51 @@ impl Shard {
         (seq, timestamp)
     }
 
-    /// Set a string value with a specific timestamp (for WAL recovery/replication).
-    pub fn set_string_with_timestamp(&mut self, key: Key, value: Bytes, timestamp: u64) {
-        match self.data.get_mut(&key) {
-            Some(Entry::String(s)) => {
-                s.set(value, timestamp);
+    /// Optimized SET path - returns just the timestamp, uses entry API efficiently.
+    #[inline]
+    pub fn set_string_inline(&mut self, key: Key, value: Bytes) -> u64 {
+        let timestamp = current_timestamp_millis();
+
+        // Use entry API to avoid double lookup
+        use std::collections::hash_map::Entry as HashEntry;
+        match self.data.entry(key) {
+            HashEntry::Occupied(mut entry) => {
+                match entry.get_mut() {
+                    Entry::String(s) => {
+                        s.set_inline(value, timestamp);
+                    }
+                    _ => {
+                        // Replace non-string entry
+                        *entry.get_mut() = Entry::String(StringEntry::new(value, timestamp));
+                    }
+                }
             }
-            _ => {
-                // Replace whatever was there (or create new)
-                let entry = StringEntry::new(value, timestamp);
-                self.data.insert(key, Entry::String(entry));
+            HashEntry::Vacant(entry) => {
+                entry.insert(Entry::String(StringEntry::new(value, timestamp)));
+            }
+        }
+
+        timestamp
+    }
+
+    /// Set a string value with a specific timestamp (for WAL recovery/replication).
+    #[inline]
+    pub fn set_string_with_timestamp(&mut self, key: Key, value: Bytes, timestamp: u64) {
+        // Use entry API to avoid double lookup
+        use std::collections::hash_map::Entry as HashEntry;
+        match self.data.entry(key) {
+            HashEntry::Occupied(mut entry) => {
+                match entry.get_mut() {
+                    Entry::String(s) => {
+                        s.set_inline(value, timestamp);
+                    }
+                    _ => {
+                        *entry.get_mut() = Entry::String(StringEntry::new(value, timestamp));
+                    }
+                }
+            }
+            HashEntry::Vacant(entry) => {
+                entry.insert(Entry::String(StringEntry::new(value, timestamp)));
             }
         }
     }
