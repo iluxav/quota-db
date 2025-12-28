@@ -27,6 +27,24 @@ pub struct StringNotification {
     pub timestamp: u64,
 }
 
+/// Quota notification for replication
+#[derive(Debug, Clone)]
+pub enum QuotaNotification {
+    /// Sync quota configuration to all peers
+    Sync {
+        shard_id: u16,
+        key: crate::types::Key,
+        limit: u64,
+        window_secs: u64,
+    },
+    /// Request tokens from allocator node
+    Request {
+        shard_id: u16,
+        key: crate::types::Key,
+        requested: u64,
+    },
+}
+
 /// Replication manager configuration
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
@@ -69,6 +87,7 @@ pub const DEFAULT_DELTA_CHANNEL_CAPACITY: usize = 10000;
 pub struct ReplicationHandle {
     tx: mpsc::Sender<DeltaNotification>,
     string_tx: mpsc::Sender<StringNotification>,
+    quota_tx: mpsc::Sender<QuotaNotification>,
     cluster_state: Arc<ClusterState>,
 }
 
@@ -107,6 +126,31 @@ impl ReplicationHandle {
     pub fn cluster_info(&self) -> ClusterStateSnapshot {
         self.cluster_state.snapshot()
     }
+
+    /// Sync quota configuration to all peers.
+    /// Called when QUOTASET creates a new quota.
+    pub fn send_quota_sync(&self, shard_id: u16, key: crate::types::Key, limit: u64, window_secs: u64) {
+        if let Err(_) = self.quota_tx.try_send(QuotaNotification::Sync {
+            shard_id,
+            key,
+            limit,
+            window_secs,
+        }) {
+            METRICS.inc(&METRICS.replication_dropped);
+        }
+    }
+
+    /// Request tokens from allocator node.
+    /// Called when local tokens are exhausted (NeedTokens).
+    pub fn request_tokens(&self, shard_id: u16, key: crate::types::Key, requested: u64) {
+        if let Err(_) = self.quota_tx.try_send(QuotaNotification::Request {
+            shard_id,
+            key,
+            requested,
+        }) {
+            METRICS.inc(&METRICS.replication_dropped);
+        }
+    }
 }
 
 /// Replication manager - handles all peer connections and delta streaming
@@ -116,10 +160,14 @@ pub struct ReplicationManager {
     delta_rx: mpsc::Receiver<DeltaNotification>,
     /// Channel to receive string updates (bounded for backpressure)
     string_rx: mpsc::Receiver<StringNotification>,
+    /// Channel to receive quota operations (bounded for backpressure)
+    quota_rx: mpsc::Receiver<QuotaNotification>,
     /// Outbound peer states (we connect to these)
     outbound_peers: HashMap<SocketAddr, PeerState>,
-    /// Active writers for sending to peers
+    /// Active writers for sending to peers (outbound connections)
     writers: HashMap<SocketAddr, PeerConnectionWriter>,
+    /// Inbound writers for sending responses back to peers
+    inbound_writers: HashMap<SocketAddr, PeerConnectionWriter>,
     /// Database reference for quota operations (optional)
     db: Option<Arc<ShardedDb>>,
     /// Number of nodes in cluster for allocator assignment
@@ -137,6 +185,7 @@ impl ReplicationManager {
     pub fn new(config: ReplicationConfig) -> (Self, ReplicationHandle) {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let (string_tx, string_rx) = mpsc::channel(config.channel_capacity);
+        let (quota_tx, quota_rx) = mpsc::channel(config.channel_capacity);
 
         let cluster_state = ClusterState::new(
             config.node_id,
@@ -154,8 +203,10 @@ impl ReplicationManager {
             config,
             delta_rx: rx,
             string_rx,
+            quota_rx,
             outbound_peers,
             writers: HashMap::new(),
+            inbound_writers: HashMap::new(),
             db: None,
             num_nodes,
             anti_entropy: None,
@@ -163,7 +214,7 @@ impl ReplicationManager {
             cluster_state: cluster_state.clone(),
         };
 
-        let handle = ReplicationHandle { tx, string_tx, cluster_state };
+        let handle = ReplicationHandle { tx, string_tx, quota_tx, cluster_state };
         (manager, handle)
     }
 
@@ -221,6 +272,9 @@ impl ReplicationManager {
         // Channel for triggering reconnections
         let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<SocketAddr>(16);
 
+        // Channel for inbound connection writers (for sending responses)
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<(SocketAddr, PeerConnectionWriter)>(16);
+
         // Spawn outbound connector tasks
         for addr in self.config.peers.clone() {
             let conn_tx = conn_tx.clone();
@@ -235,8 +289,9 @@ impl ReplicationManager {
             let msg_tx_clone = msg_tx.clone();
             let apply_delta_clone = apply_delta.clone();
             let node_id = self.config.node_id;
+            let inbound_tx_clone = inbound_tx.clone();
             tokio::spawn(async move {
-                Self::listener_task(listener, node_id, msg_tx_clone, apply_delta_clone).await;
+                Self::listener_task(listener, node_id, msg_tx_clone, apply_delta_clone, inbound_tx_clone).await;
             });
         }
 
@@ -265,6 +320,11 @@ impl ReplicationManager {
                 // Receive string updates to replicate
                 Some(notif) = self.string_rx.recv() => {
                     self.handle_string_notification(notif).await;
+                }
+
+                // Receive quota operations to replicate
+                Some(notif) = self.quota_rx.recv() => {
+                    self.handle_quota_notification(notif).await;
                 }
 
                 // New outbound connection established
@@ -304,17 +364,30 @@ impl ReplicationManager {
                     }
                 }
 
+                // Receive inbound connection writers
+                Some((addr, writer)) = inbound_rx.recv() => {
+                    info!("Storing inbound writer for {}", addr);
+                    self.inbound_writers.insert(addr, writer);
+                }
+
                 // Receive messages from peers
                 Some((addr, msg)) = msg_rx.recv() => {
                     let responses = self.handle_peer_message(addr, msg);
                     if !responses.is_empty() {
-                        if let Some(writer) = self.writers.get_mut(&addr) {
+                        // Try inbound_writers first (for messages from inbound connections),
+                        // then fall back to outbound writers
+                        let writer = self.inbound_writers.get_mut(&addr)
+                            .or_else(|| self.writers.get_mut(&addr));
+
+                        if let Some(writer) = writer {
                             for resp in responses {
                                 if let Err(e) = writer.send(&resp).await {
                                     error!("Failed to send response to {}: {}", addr, e);
                                     break;
                                 }
                             }
+                        } else {
+                            warn!("No writer found for {} to send {} responses", addr, responses.len());
                         }
                     }
                 }
@@ -472,6 +545,71 @@ impl ReplicationManager {
         }
     }
 
+    /// Handle quota notifications: sync config or request tokens
+    async fn handle_quota_notification(&mut self, notif: QuotaNotification) {
+        match notif {
+            QuotaNotification::Sync { shard_id, key, limit, window_secs } => {
+                debug!(
+                    "Syncing quota key {:?} (limit={}, window={}s) to {} peers",
+                    String::from_utf8_lossy(key.as_bytes()),
+                    limit,
+                    window_secs,
+                    self.writers.len()
+                );
+
+                let msg = Message::quota_sync(shard_id, key, limit, window_secs);
+
+                // Send to all connected peers
+                for (addr, writer) in &mut self.writers {
+                    if let Err(e) = writer.send(&msg).await {
+                        warn!("Failed to send QuotaSync to {}: {}", addr, e);
+                    } else {
+                        debug!("Sent QuotaSync to {}", addr);
+                    }
+                }
+            }
+            QuotaNotification::Request { shard_id, key, requested } => {
+                // Find allocator node for this shard and send request
+                let allocator_node_id = ((shard_id as usize) % self.num_nodes + 1) as u32;
+
+                info!(
+                    "Token request received: {} tokens for {:?} from allocator node {}",
+                    requested,
+                    String::from_utf8_lossy(key.as_bytes()),
+                    allocator_node_id
+                );
+
+                // If we're the allocator, handle locally
+                if allocator_node_id == self.config.node_id.as_u32() {
+                    if let Some(ref db) = self.db {
+                        let granted = db.allocator_grant(&key, self.config.node_id, requested);
+                        if granted > 0 {
+                            db.quota_add_tokens(&key, granted);
+                            info!("Self-granted {} tokens for {:?}", granted, key);
+                        }
+                    }
+                    return;
+                }
+
+                // Find the peer that is the allocator
+                let msg = Message::quota_request(shard_id, key.clone(), requested, self.config.node_id.as_u32());
+                for (addr, writer) in &mut self.writers {
+                    if let Some(peer) = self.outbound_peers.get(addr) {
+                        if peer.node_id == Some(NodeId::new(allocator_node_id)) {
+                            if let Err(e) = writer.send(&msg).await {
+                                warn!("Failed to send QuotaRequest to {}: {}", addr, e);
+                            } else {
+                                info!("Sent QuotaRequest to allocator {} (node {})", addr, allocator_node_id);
+                            }
+                            return;
+                        }
+                    }
+                }
+                warn!("Allocator node {} not connected, cannot request tokens", allocator_node_id);
+            }
+        }
+    }
+
     /// Update replication lag metrics
     fn update_lag_metrics(&self) {
         let head_seqs: Vec<u64> = if let Some(ref db) = self.db {
@@ -559,30 +697,26 @@ impl ReplicationManager {
                 // Inbound deltas are handled by the reader task directly
                 vec![]
             }
-            Message::QuotaRequest { shard_id, key, requested } => {
+            Message::QuotaRequest { shard_id, key, requested, from_node_id } => {
                 // Handle token request from a remote node
-                debug!(
-                    "Received QuotaRequest from {} for key {:?}, shard {}, requested {}",
-                    addr, key, shard_id, requested
+                let from_node = NodeId::new(from_node_id);
+                info!(
+                    "Received QuotaRequest from node {} for key {:?}, shard {}, requested {}",
+                    from_node_id, String::from_utf8_lossy(key.as_bytes()), shard_id, requested
                 );
 
                 // Process if we're the allocator for this shard
                 if self.is_allocator(shard_id) {
                     if let Some(ref db) = self.db {
-                        // Get the requesting node's ID from peer state
-                        let from_node = self.outbound_peers.get(&addr)
-                            .and_then(|p| p.node_id)
-                            .unwrap_or_else(|| NodeId::new(0));
-
                         // Try to grant tokens
                         let batch_size = db.quota_batch_size(&key);
                         let granted = db.allocator_grant(&key, from_node, batch_size.max(requested));
 
                         if granted > 0 {
-                            debug!("Granting {} tokens for {:?} to node {}", granted, key, from_node.as_u32());
+                            info!("Granting {} tokens for {:?} to node {}", granted, String::from_utf8_lossy(key.as_bytes()), from_node_id);
                             return vec![Message::quota_grant(shard_id, key, granted)];
                         } else {
-                            debug!("Denying token request for {:?} to node {}", key, from_node.as_u32());
+                            info!("Denying token request for {:?} to node {}", String::from_utf8_lossy(key.as_bytes()), from_node_id);
                             return vec![Message::quota_deny(shard_id, key)];
                         }
                     }
@@ -591,9 +725,9 @@ impl ReplicationManager {
             }
             Message::QuotaGrant { shard_id, key, granted } => {
                 // Handle token grant from allocator - add tokens to local quota entry
-                debug!(
+                info!(
                     "Received QuotaGrant from {} for key {:?}, shard {}, granted {}",
-                    addr, key, shard_id, granted
+                    addr, String::from_utf8_lossy(key.as_bytes()), shard_id, granted
                 );
 
                 if let Some(ref db) = self.db {
@@ -776,6 +910,7 @@ impl ReplicationManager {
         node_id: NodeId,
         msg_tx: mpsc::Sender<(SocketAddr, Message)>,
         apply_delta: Arc<dyn Fn(u16, Delta) + Send + Sync>,
+        inbound_tx: mpsc::Sender<(SocketAddr, PeerConnectionWriter)>,
     ) {
         loop {
             match listener.accept().await {
@@ -791,11 +926,20 @@ impl ReplicationManager {
                                 continue;
                             }
 
-                            // Spawn reader task
+                            // Split connection into reader and writer
+                            let (reader, writer) = conn.split();
+
+                            // Send writer to main loop for response handling
+                            if let Err(e) = inbound_tx.send((addr, writer)).await {
+                                error!("Failed to send inbound writer for {}: {}", addr, e);
+                                continue;
+                            }
+
+                            // Spawn reader task (using split reader that works with just the reader part)
                             let msg_tx = msg_tx.clone();
                             let apply_delta = apply_delta.clone();
                             tokio::spawn(async move {
-                                Self::connection_reader_task(addr, conn, msg_tx, apply_delta).await;
+                                Self::split_reader_task(addr, reader, msg_tx, apply_delta).await;
                             });
                         }
                         Err(e) => {

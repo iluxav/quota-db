@@ -31,8 +31,17 @@ pub enum Command {
     /// SET key value - store a string value
     Set(Key, Bytes),
 
-    /// QUOTASET key limit window_secs - set up a rate limit
+    /// QUOTASET key limit window_secs - set up a rate limit (deprecated, use QUOTAINCR)
     QuotaSet(Key, u64, u64),
+
+    /// QUOTAINCR key limit window_secs [amount] - consume tokens (creates quota if not exists)
+    /// Returns remaining tokens, or -1 if denied
+    QuotaIncr {
+        key: Key,
+        limit: u64,
+        window_secs: u64,
+        amount: u64,
+    },
 
     /// QUOTAGET key - get quota info (limit, window_secs, remaining)
     QuotaGet(Key),
@@ -67,6 +76,21 @@ pub enum Command {
 
     /// CLUSTER INFO - return cluster state information
     ClusterInfo,
+
+    /// SELECT db - select database (no-op, always returns OK for compatibility)
+    Select(u64),
+
+    /// CLIENT subcommand - client management (stub for compatibility)
+    Client,
+
+    /// COMMAND - command info (stub for compatibility)
+    CommandInfo,
+
+    /// HELLO [protover] - RESP3 protocol negotiation (stub for compatibility)
+    Hello,
+
+    /// ECHO message - echo back the message
+    Echo(Bytes),
 }
 
 impl Command {
@@ -138,6 +162,29 @@ impl Command {
                 let limit = Self::extract_u64(&array, 2)?;
                 let window_secs = Self::extract_u64(&array, 3)?;
                 Ok(Command::QuotaSet(key, limit, window_secs))
+            }
+            b"QUOTAINCR" => {
+                // QUOTAINCR key limit window_secs [amount]
+                // Minimum 4 args (cmd, key, limit, window), optional 5th (amount)
+                if array.len() < 4 || array.len() > 5 {
+                    return Err(Error::InvalidArgument(
+                        "wrong number of arguments for 'QUOTAINCR' command".into(),
+                    ));
+                }
+                let key = Self::extract_key(&array, 1)?;
+                let limit = Self::extract_u64(&array, 2)?;
+                let window_secs = Self::extract_u64(&array, 3)?;
+                let amount = if array.len() == 5 {
+                    Self::extract_u64(&array, 4)?
+                } else {
+                    1 // Default to 1 if not specified
+                };
+                Ok(Command::QuotaIncr {
+                    key,
+                    limit,
+                    window_secs,
+                    amount,
+                })
             }
             b"QUOTAGET" => {
                 Self::ensure_args(&array, 2, "QUOTAGET")?;
@@ -246,6 +293,32 @@ impl Command {
                     ))
                 }
             }
+            b"SELECT" => {
+                // SELECT db - always accept (single db, returns OK)
+                let db = if array.len() >= 2 {
+                    Self::extract_u64(&array, 1).unwrap_or(0)
+                } else {
+                    0
+                };
+                Ok(Command::Select(db))
+            }
+            b"CLIENT" => {
+                // CLIENT SETNAME, CLIENT GETNAME, etc. - stub for compatibility
+                Ok(Command::Client)
+            }
+            b"COMMAND" => {
+                // COMMAND, COMMAND DOCS, etc. - stub for compatibility
+                Ok(Command::CommandInfo)
+            }
+            b"HELLO" => {
+                // HELLO [protover] - RESP3 protocol negotiation
+                Ok(Command::Hello)
+            }
+            b"ECHO" => {
+                Self::ensure_args(&array, 2, "ECHO")?;
+                let msg = Self::extract_bytes(&array, 1)?;
+                Ok(Command::Echo(msg))
+            }
             _ => {
                 let cmd_str = String::from_utf8_lossy(cmd_name);
                 Err(Error::UnknownCommand(cmd_str.to_string()))
@@ -318,6 +391,7 @@ impl Command {
             Command::DecrBy(_, _) => "DECRBY",
             Command::Set(_, _) => "SET",
             Command::QuotaSet(_, _, _) => "QUOTASET",
+            Command::QuotaIncr { .. } => "QUOTAINCR",
             Command::QuotaGet(_) => "QUOTAGET",
             Command::QuotaDel(_) => "QUOTADEL",
             Command::ConfigGet(_) => "CONFIG GET",
@@ -328,6 +402,11 @@ impl Command {
             Command::Keys(_) => "KEYS",
             Command::Scan { .. } => "SCAN",
             Command::ClusterInfo => "CLUSTER INFO",
+            Command::Select(_) => "SELECT",
+            Command::Client => "CLIENT",
+            Command::CommandInfo => "COMMAND",
+            Command::Hello => "HELLO",
+            Command::Echo(_) => "ECHO",
         }
     }
 }

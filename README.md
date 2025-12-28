@@ -56,11 +56,56 @@ DECRBY inventory 5
 # Get current value
 GET pageviews
 
-# Set counter to specific value
+# Set counter to specific value (integer)
 SET counter 1000
 
 # Ping/health check
 PING
+```
+
+### String Caching
+
+QuotaDB supports string values for caching JSON, HTML, and other content:
+
+```bash
+# Store JSON data
+SET user:123 '{"name":"Alice","email":"alice@example.com"}'
+
+# Store HTML cache
+SET page:home '<!DOCTYPE html><html>...</html>'
+
+# Retrieve cached content
+GET user:123
+GET page:home
+```
+
+String values use Last-Write-Wins (LWW) semantics for conflict resolution in multi-node clusters. Each write includes a timestamp, and the newest value wins during replication.
+
+### Key Operations
+
+```bash
+# List all keys matching a pattern
+KEYS user:*
+KEYS *
+
+# Scan keys incrementally (cursor-based)
+SCAN 0 MATCH user:* COUNT 100
+
+# Get database size
+DBSIZE
+```
+
+### Monitoring
+
+```bash
+# Server info and statistics
+INFO
+INFO server
+INFO replication
+INFO stats
+
+# Cluster status (when replication enabled)
+CLUSTER INFO
 ```
 
 ### Rate Limiting (Quotas)
@@ -154,6 +199,7 @@ shard_id = hash(key) % num_shards
 ```
 
 Each shard has:
+
 - Independent HashMap storage
 - Its own replication log
 - Its own TTL queue
@@ -183,13 +229,23 @@ Active replication streams deltas between nodes:
 
 ## Performance
 
-Benchmarks vs Redis 7 (2 CPU, 2GB RAM):
+Benchmarks vs Redis 7 (2 CPU, 2GB RAM Docker containers):
 
-| Benchmark | QuotaDB | Redis | Comparison |
-|-----------|---------|-------|------------|
-| Single INCR | 3,569 rps | 3,544 rps | +0.7% |
-| Concurrent (100 conn) | 63,492 rps | 62,539 rps | +1.5% |
-| Pipelined (P=16) | 917,431 rps | 851,789 rps | +7.7% |
+### Counter Operations (INCR)
+
+| Benchmark             |     QuotaDB |       Redis | Comparison |
+| --------------------- | ----------: | ----------: | ---------- |
+| Single connection     |   3,569 rps |   3,544 rps | 100.7%     |
+| Concurrent (100 conn) |  63,492 rps |  62,539 rps | 101.5%     |
+| Pipelined (P=16)      | 917,431 rps | 851,789 rps | 107.7%     |
+
+### String Operations (SET)
+
+| Benchmark            |     QuotaDB |       Redis | Comparison |
+| -------------------- | ----------: | ----------: | ---------- |
+| Single connection    |   3,674 rps |   3,673 rps | 100.0%     |
+| Concurrent (50 conn) |  48,309 rps |  48,520 rps | 99.6%      |
+| Pipelined (P=16)     | 568,182 rps | 588,235 rps | 96.6%      |
 
 ### Running Benchmarks
 
@@ -197,9 +253,17 @@ Benchmarks vs Redis 7 (2 CPU, 2GB RAM):
 # Start QuotaDB and Redis
 docker compose -f docker/docker-compose.yml up -d
 
-# Run benchmarks
+# Counter benchmarks
 redis-benchmark -p 6380 -n 100000 -q -t ping,incr,get
 redis-benchmark -p 6379 -n 100000 -q -t ping,incr,get
+
+# String SET benchmarks
+redis-benchmark -p 6380 -n 100000 -t set -c 50
+redis-benchmark -p 6379 -n 100000 -t set -c 50
+
+# Pipelined benchmarks
+redis-benchmark -p 6380 -n 100000 -t set -c 50 -P 16
+redis-benchmark -p 6379 -n 100000 -t set -c 50 -P 16
 
 # Stop containers
 docker compose -f docker/docker-compose.yml down
@@ -207,21 +271,48 @@ docker compose -f docker/docker-compose.yml down
 
 ## Supported Commands
 
-| Command | Description |
-|---------|-------------|
-| `PING [msg]` | Health check, returns PONG or echoes message |
-| `GET key` | Get counter value |
-| `INCR key` | Increment by 1 |
-| `INCRBY key delta` | Increment by delta |
-| `DECR key` | Decrement by 1 |
-| `DECRBY key delta` | Decrement by delta |
-| `SET key value` | Set counter to value |
-| `QUOTASET key limit window` | Set up rate limit |
-| `QUOTAGET key` | Get quota info |
-| `QUOTADEL key` | Delete quota |
-| `CONFIG GET param` | Compatibility stub |
-| `DBSIZE` | Compatibility stub |
-| `FLUSHDB` | Compatibility stub |
+### Core Commands
+
+| Command            | Description                                  |
+| ------------------ | -------------------------------------------- |
+| `PING [msg]`       | Health check, returns PONG or echoes message |
+| `GET key`          | Get value (counter integer or cached string) |
+| `SET key value`    | Set string value (for caching)               |
+| `INCR key`         | Increment counter by 1                       |
+| `INCRBY key delta` | Increment counter by delta                   |
+| `DECR key`         | Decrement counter by 1                       |
+| `DECRBY key delta` | Decrement counter by delta                   |
+
+### Rate Limiting
+
+| Command                     | Description                                         |
+| --------------------------- | --------------------------------------------------- |
+| `QUOTASET key limit window` | Create rate limit (limit tokens per window seconds) |
+| `QUOTAGET key`              | Get quota info: [limit, window_secs, remaining]     |
+| `QUOTADEL key`              | Delete quota, convert back to regular counter       |
+
+### Key Management
+
+| Command                                 | Description                                         |
+| --------------------------------------- | --------------------------------------------------- |
+| `KEYS pattern`                          | List keys matching glob pattern (`*`, `?`, `[abc]`) |
+| `SCAN cursor [MATCH pattern] [COUNT n]` | Incrementally iterate keys                          |
+| `DBSIZE`                                | Return total number of keys                         |
+
+### Monitoring
+
+| Command          | Description                                         |
+| ---------------- | --------------------------------------------------- |
+| `INFO [section]` | Server statistics (server, replication, stats, all) |
+| `CLUSTER INFO`   | Cluster status and peer connections                 |
+
+### Compatibility
+
+| Command                  | Description                   |
+| ------------------------ | ----------------------------- |
+| `CONFIG GET param`       | Returns empty (compatibility) |
+| `CONFIG SET param value` | No-op (compatibility)         |
+| `FLUSHDB`                | No-op (compatibility)         |
 
 ## Development
 

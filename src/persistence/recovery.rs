@@ -342,6 +342,7 @@ mod tests {
         let quota_info = shard.quota_get(&Key::from("rate_limit")).unwrap();
         assert_eq!(quota_info.0, 10000); // limit
         assert_eq!(quota_info.1, 60); // window_secs
+        // Escrow model: quota starts at 0, then 500 tokens granted
         assert_eq!(quota_info.2, 500); // remaining tokens
 
         let _ = std::fs::remove_dir_all(&dir);

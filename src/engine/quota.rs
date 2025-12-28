@@ -35,12 +35,24 @@ pub struct QuotaEntry {
 
 impl QuotaEntry {
     /// Create a new quota entry with the specified limit and window.
+    /// Starts with 0 tokens - must request from allocator.
+    /// Uses aligned window start for global consistency.
     pub fn new(limit: u64, window_secs: u64) -> Self {
         Self {
             limit,
             window_secs,
-            local_tokens: 0, // Start with 0, must request from allocator
-            window_start: current_timestamp_secs(),
+            local_tokens: 0, // Start with 0, request from allocator
+            window_start: aligned_window_start(window_secs),
+        }
+    }
+
+    /// Create a new quota entry with initial tokens (for allocator node).
+    pub fn new_with_tokens(limit: u64, window_secs: u64, initial_tokens: i64) -> Self {
+        Self {
+            limit,
+            window_secs,
+            local_tokens: initial_tokens,
+            window_start: aligned_window_start(window_secs),
         }
     }
 
@@ -76,11 +88,13 @@ impl QuotaEntry {
     }
 
     /// Reset the window (called when window expires).
+    /// Resets tokens to 0 - must request from allocator again.
     /// Returns the old window_start for replication.
+    /// Uses aligned window start for global consistency.
     pub fn reset_window(&mut self) -> u64 {
         let old_start = self.window_start;
-        self.window_start = current_timestamp_secs();
-        self.local_tokens = 0;
+        self.window_start = aligned_window_start(self.window_secs);
+        self.local_tokens = 0; // Reset to 0, request from allocator
         old_start
     }
 
@@ -251,6 +265,15 @@ fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+/// Calculate aligned window start time for global consistency.
+/// All nodes will use the same window boundaries based on epoch time.
+/// Example: with 60-second windows, boundaries are 0, 60, 120, 180, etc.
+#[inline]
+fn aligned_window_start(window_secs: u64) -> u64 {
+    let now = current_timestamp_secs();
+    (now / window_secs) * window_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,20 +283,13 @@ mod tests {
         let entry = QuotaEntry::new(10000, 60);
         assert_eq!(entry.limit(), 10000);
         assert_eq!(entry.window_secs(), 60);
-        assert_eq!(entry.local_tokens(), 0);
-    }
-
-    #[test]
-    fn test_try_consume_insufficient() {
-        let mut entry = QuotaEntry::new(10000, 60);
-        // No local tokens, should fail
-        assert_eq!(entry.try_consume(1), None);
+        assert_eq!(entry.local_tokens(), 0); // Starts with 0 (escrow model)
     }
 
     #[test]
     fn test_try_consume_success() {
-        let mut entry = QuotaEntry::new(10000, 60);
-        entry.add_tokens(100);
+        // Use new_with_tokens since escrow model starts with 0
+        let mut entry = QuotaEntry::new_with_tokens(100, 60, 100);
 
         assert_eq!(entry.try_consume(10), Some(90));
         assert_eq!(entry.try_consume(50), Some(40));
@@ -281,13 +297,22 @@ mod tests {
     }
 
     #[test]
-    fn test_add_tokens() {
-        let mut entry = QuotaEntry::new(10000, 60);
-        entry.add_tokens(500);
-        assert_eq!(entry.local_tokens(), 500);
+    fn test_try_consume_exhausted() {
+        // Use new_with_tokens since escrow model starts with 0
+        let mut entry = QuotaEntry::new_with_tokens(10, 60, 10);
+        assert_eq!(entry.try_consume(10), Some(0)); // Use all tokens
+        assert_eq!(entry.try_consume(1), None); // No tokens left
+    }
 
-        entry.add_tokens(300);
-        assert_eq!(entry.local_tokens(), 800);
+    #[test]
+    fn test_add_tokens() {
+        let mut entry = QuotaEntry::new(100, 60);
+        // Starts with 0 (escrow model), add tokens
+        entry.add_tokens(50);
+        assert_eq!(entry.local_tokens(), 50);
+
+        entry.add_tokens(30);
+        assert_eq!(entry.local_tokens(), 80);
     }
 
     #[test]

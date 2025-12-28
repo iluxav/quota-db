@@ -77,6 +77,7 @@ pub enum Message {
         shard_id: u16,
         key: Key,
         requested: u64,
+        from_node_id: u32,  // Requesting node's ID
     },
     /// Grant tokens to requesting node
     QuotaGrant {
@@ -162,6 +163,7 @@ impl Message {
                 shard_id,
                 key,
                 requested,
+                from_node_id,
             } => {
                 buf.put_u8(MessageType::QuotaRequest as u8);
                 buf.put_u16_le(*shard_id);
@@ -169,6 +171,7 @@ impl Message {
                 buf.put_u16_le(key_bytes.len() as u16);
                 buf.put_slice(key_bytes);
                 buf.put_u64_le(*requested);
+                buf.put_u32_le(*from_node_id);
             }
             Message::QuotaGrant {
                 shard_id,
@@ -329,15 +332,18 @@ impl Message {
                 }
                 let shard_id = buf.get_u16_le();
                 let key_len = buf.get_u16_le() as usize;
-                if buf.remaining() < key_len + 8 {
+                if buf.remaining() < key_len + 8 + 4 {
+                    // key + requested(u64) + from_node_id(u32)
                     return None;
                 }
                 let key = Key::new(buf.copy_to_bytes(key_len));
                 let requested = buf.get_u64_le();
+                let from_node_id = buf.get_u32_le();
                 Some(Message::QuotaRequest {
                     shard_id,
                     key,
                     requested,
+                    from_node_id,
                 })
             }
             MessageType::QuotaGrant => {
@@ -512,11 +518,12 @@ impl Message {
     }
 
     /// Create a QuotaRequest message
-    pub fn quota_request(shard_id: u16, key: Key, requested: u64) -> Self {
+    pub fn quota_request(shard_id: u16, key: Key, requested: u64, from_node_id: u32) -> Self {
         Message::QuotaRequest {
             shard_id,
             key,
             requested,
+            from_node_id,
         }
     }
 
@@ -736,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_quota_request_encode_decode() {
-        let msg = Message::quota_request(5, Key::from("api:user:123"), 1000);
+        let msg = Message::quota_request(5, Key::from("api:user:123"), 1000, 7);
 
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
@@ -749,10 +756,12 @@ mod tests {
                 shard_id,
                 key,
                 requested,
+                from_node_id,
             } => {
                 assert_eq!(shard_id, 5);
                 assert_eq!(key.as_bytes(), b"api:user:123");
                 assert_eq!(requested, 1000);
+                assert_eq!(from_node_id, 7);
             }
             _ => panic!("Expected QuotaRequest message"),
         }

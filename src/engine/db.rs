@@ -138,6 +138,8 @@ pub struct ShardedDb {
     shards: Vec<RwLock<Shard>>,
     num_shards: usize,
     node_id: NodeId,
+    /// Number of nodes in cluster (1 = single node, >1 = cluster)
+    num_nodes: usize,
     /// Optional persistence handle for WAL logging
     persistence: Option<PersistenceHandle>,
 }
@@ -147,6 +149,7 @@ impl ShardedDb {
     pub fn new(config: &Config) -> Self {
         let node_id = config.node_id();
         let num_shards = config.shards;
+        let num_nodes = config.peers.len() + 1; // peers + self
 
         let mut shards = Vec::with_capacity(num_shards);
         for id in 0..num_shards {
@@ -157,6 +160,7 @@ impl ShardedDb {
             shards,
             num_shards,
             node_id,
+            num_nodes,
             persistence: None,
         }
     }
@@ -169,6 +173,7 @@ impl ShardedDb {
     ) -> Self {
         let node_id = config.node_id();
         let num_shards = config.shards;
+        let num_nodes = config.peers.len() + 1; // peers + self
 
         let shards: Vec<_> = if persistence_config.enabled {
             (0..num_shards)
@@ -195,6 +200,7 @@ impl ShardedDb {
             shards,
             num_shards,
             node_id,
+            num_nodes,
             persistence: persistence_handle,
         }
     }
@@ -215,6 +221,28 @@ impl ShardedDb {
     #[inline]
     fn shard_index(&self, key: &Key) -> usize {
         (key.shard_hash() as usize) % self.num_shards
+    }
+
+    /// Check if this node is the allocator for a given shard.
+    /// The allocator is the node that owns the shard: (shard_id % num_nodes) + 1
+    /// In single-node mode, this node is always the allocator.
+    #[inline]
+    pub fn is_allocator(&self, shard_id: u16) -> bool {
+        if self.num_nodes <= 1 {
+            return true;
+        }
+        let allocator_node = ((shard_id as usize) % self.num_nodes + 1) as u32;
+        allocator_node == self.node_id.as_u32()
+    }
+
+    /// Get the allocator node ID for a given shard.
+    #[inline]
+    pub fn allocator_for_shard(&self, shard_id: u16) -> NodeId {
+        if self.num_nodes <= 1 {
+            return self.node_id;
+        }
+        let allocator_node = ((shard_id as usize) % self.num_nodes + 1) as u32;
+        NodeId::new(allocator_node)
     }
 
     /// Increment a key by delta, returning (shard_id, new_value, replication_delta).
@@ -336,6 +364,24 @@ impl ShardedDb {
         }
     }
 
+    /// Ensure a quota exists for a key, creating it only if it doesn't exist.
+    /// Returns true if a new quota was created, false if it already existed.
+    /// This is idempotent - only creates once.
+    pub fn ensure_quota(&self, key: Key, limit: u64, window_secs: u64) -> bool {
+        let idx = self.shard_index(&key);
+        let shard_id = idx as u16;
+        let mut shard = self.shards[idx].write();
+        let created = shard.ensure_quota(key.clone(), limit, window_secs);
+
+        // Only log to WAL if we actually created a new quota
+        if created {
+            if let Some(ref handle) = self.persistence {
+                handle.log_quota_set(shard_id, 0, &key, limit, window_secs);
+            }
+        }
+        created
+    }
+
     /// Get quota info for a key: (limit, window_secs, remaining).
     pub fn quota_get(&self, key: &Key) -> Option<(u64, u64, i64)> {
         let idx = self.shard_index(key);
@@ -355,8 +401,8 @@ impl ShardedDb {
     }
 
     /// Try to consume tokens from a quota.
-    /// For single-node operation, this also acts as the allocator.
-    pub fn quota_consume(&self, key: &Key, amount: u64) -> QuotaResult {
+    /// Returns the shard_id along with the result for use in token requests.
+    pub fn quota_consume(&self, key: &Key, amount: u64) -> (u16, QuotaResult) {
         let idx = self.shard_index(key);
         let shard_id = idx as u16;
         let mut shard = self.shards[idx].write();
@@ -364,29 +410,49 @@ impl ShardedDb {
         // First try local consumption
         let result = shard.quota_consume(key, amount);
 
+        tracing::info!(
+            "quota_consume: key={:?} shard={} initial_result={:?} is_allocator={} num_nodes={} node_id={}",
+            String::from_utf8_lossy(key.as_bytes()),
+            shard_id,
+            result,
+            self.is_allocator(shard_id),
+            self.num_nodes,
+            self.node_id.as_u32()
+        );
+
         match result {
             QuotaResult::NeedTokens => {
-                // In single-node mode, we are the allocator
-                // Request tokens from ourselves
-                let batch_size = shard.quota_batch_size(key);
-                let (granted, seq_opt) = shard.allocator_grant(key, self.node_id, batch_size);
+                // Check if we are the allocator for this shard
+                if self.is_allocator(shard_id) {
+                    // We are the allocator - grant tokens to ourselves
+                    let batch_size = shard.quota_batch_size(key);
+                    let (granted, seq_opt) = shard.allocator_grant(key, self.node_id, batch_size);
 
-                // Log grant to WAL if persistence is enabled and tokens were granted
-                if let (Some(ref handle), Some(seq)) = (&self.persistence, seq_opt) {
-                    handle.log_quota_grant(shard_id, seq, key, self.node_id.as_u32(), granted);
-                }
+                    tracing::info!(
+                        "quota_consume: allocator self-grant batch_size={} granted={}",
+                        batch_size, granted
+                    );
 
-                if granted > 0 {
-                    // Add tokens to local balance
-                    shard.quota_add_tokens(key, granted);
-                    // Try consumption again
-                    shard.quota_consume(key, amount)
+                    // Log grant to WAL if persistence is enabled and tokens were granted
+                    if let (Some(ref handle), Some(seq)) = (&self.persistence, seq_opt) {
+                        handle.log_quota_grant(shard_id, seq, key, self.node_id.as_u32(), granted);
+                    }
+
+                    if granted > 0 {
+                        // Add tokens to local balance
+                        shard.quota_add_tokens(key, granted);
+                        // Try consumption again
+                        (shard_id, shard.quota_consume(key, amount))
+                    } else {
+                        // No tokens available from allocator
+                        (shard_id, QuotaResult::Denied)
+                    }
                 } else {
-                    // No tokens available from allocator
-                    QuotaResult::Denied
+                    // We are NOT the allocator - need to request tokens from remote allocator
+                    (shard_id, QuotaResult::NeedTokens)
                 }
             }
-            other => other,
+            other => (shard_id, other),
         }
     }
 

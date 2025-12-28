@@ -329,13 +329,33 @@ impl Shard {
     pub fn quota_set(&mut self, key: Key, limit: u64, window_secs: u64) -> u64 {
         let seq = self.rep_log.next_seq();
 
+        // Create quota with aligned window
         let quota = QuotaEntry::new(limit, window_secs);
+        let window_start = quota.window_start();
         self.data.insert(key.clone(), Entry::Quota(quota));
 
-        // Initialize allocator state for this quota
-        self.allocators.insert(key, AllocatorState::new());
+        // Sync allocator window with quota window for consistency
+        self.allocators.insert(key, AllocatorState::with_window_start(window_start));
 
         seq
+    }
+
+    /// Ensure a quota exists for a key, creating it only if it doesn't exist.
+    /// Returns true if a new quota was created, false if it already existed.
+    /// This is idempotent - repeated calls with same params are no-ops.
+    pub fn ensure_quota(&mut self, key: Key, limit: u64, window_secs: u64) -> bool {
+        if self.data.contains_key(&key) {
+            // Quota (or some entry) already exists - don't reset
+            false
+        } else {
+            // Create new quota with aligned window
+            let quota = QuotaEntry::new(limit, window_secs);
+            let window_start = quota.window_start();
+            self.data.insert(key.clone(), Entry::Quota(quota));
+            // Sync allocator window with quota window for consistency
+            self.allocators.insert(key, AllocatorState::with_window_start(window_start));
+            true
+        }
     }
 
     /// Get quota info for a key: (limit, window_secs, remaining)
@@ -396,21 +416,24 @@ impl Shard {
     /// Grant tokens from allocator to a node.
     /// Returns (granted_tokens, seq) - seq is only set if tokens were granted.
     pub fn allocator_grant(&mut self, key: &Key, node: NodeId, requested: u64) -> (u64, Option<u64>) {
-        // Get the limit from the quota entry
-        let limit = match self.data.get(key) {
-            Some(Entry::Quota(q)) => q.limit(),
+        // Get the limit from the quota entry, and reset window if expired
+        let limit = match self.data.get_mut(key) {
+            Some(Entry::Quota(q)) => {
+                // Check and reset window if expired (updates to new aligned window)
+                if q.is_window_expired() {
+                    q.reset_window();
+                    // Also reset allocator state with the NEW window_start
+                    if let Some(alloc) = self.allocators.get_mut(key) {
+                        alloc.reset(q.window_start());
+                    }
+                }
+                q.limit()
+            }
             _ => return (0, None),
         };
 
         // Get or create allocator state
         let alloc = self.allocators.entry(key.clone()).or_default();
-
-        // Check if we need to reset the window
-        if let Some(Entry::Quota(q)) = self.data.get(key) {
-            if q.is_window_expired() {
-                alloc.reset(q.window_start());
-            }
-        }
 
         let granted = alloc.try_grant(node, requested, limit);
         if granted > 0 {
@@ -1117,14 +1140,24 @@ mod tests {
         // No quota initially
         assert!(shard.get_quota_mut(&key).is_none());
 
-        // Add a quota
+        // Add a quota (starts with 0 in escrow model)
         shard.quota_set(key.clone(), 1000, 60);
 
-        // Should be able to get mutable reference
-        let quota = shard.get_quota_mut(&key).unwrap();
-        quota.add_tokens(500);
+        // Verify initial tokens (escrow model: starts at 0)
+        let info = shard.quota_get(&key).unwrap();
+        assert_eq!(info.2, 0); // starts at 0 in escrow model
+
+        // Grant tokens (simulating allocator response)
+        shard.quota_add_tokens(&key, 1000);
 
         // Verify tokens were added
+        let info = shard.quota_get(&key).unwrap();
+        assert_eq!(info.2, 1000); // now has tokens
+
+        // Consume some tokens
+        shard.quota_consume(&key, 500);
+
+        // Verify tokens were consumed
         let info = shard.quota_get(&key).unwrap();
         assert_eq!(info.2, 500); // remaining tokens
     }
