@@ -3,8 +3,8 @@
 # QuotaDB Installation Script
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/<owner>/quota-db/main/scripts/install.sh | bash
-#   curl -sSL ... | bash -s -- --version v0.1.0 --prefix /opt/quota-db
+#   curl -sSL https://raw.githubusercontent.com/iluxav/quota-db/main/scripts/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/iluxav/quota-db/main/scripts/install.sh | bash -s -- --version v0.1.0 --prefix /opt/quota-db
 #
 # Options:
 #   --version VERSION    Install specific version (default: latest)
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # Configuration
-GITHUB_REPO="${GITHUB_REPO:-<owner>/quota-db}"  # TODO: Update with actual repo
+GITHUB_REPO="${GITHUB_REPO:-iluxav/quota-db}"
 BINARY_NAME="quota-db"
 INSTALL_PREFIX="/usr/local"
 VERSION=""
@@ -64,13 +64,13 @@ Options:
 
 Examples:
     # Install latest version
-    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/scripts/install.sh | bash
+    curl -sSL https://raw.githubusercontent.com/iluxav/quota-db/main/scripts/install.sh | bash
 
     # Install specific version
-    curl -sSL ... | bash -s -- --version v0.1.0
+    curl -sSL https://raw.githubusercontent.com/iluxav/quota-db/main/scripts/install.sh | bash -s -- --version v0.1.0
 
     # Install to custom location
-    curl -sSL ... | bash -s -- --prefix ~/.local
+    curl -sSL https://raw.githubusercontent.com/iluxav/quota-db/main/scripts/install.sh | bash -s -- --prefix ~/.local
 EOF
 }
 
