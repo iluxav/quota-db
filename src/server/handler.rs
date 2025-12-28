@@ -107,10 +107,16 @@ impl Handler {
                     Frame::pong()
                 }
             }
-            Command::Get(key) => match self.db.get(&key) {
-                Some(value) => Frame::integer(value),
-                None => Frame::Null,
-            },
+            Command::Get(key) => {
+                // Check for string first, then counter/quota
+                if let Some(value) = self.db.get_string(&key) {
+                    Frame::Bulk(value)
+                } else if let Some(value) = self.db.get(&key) {
+                    Frame::integer(value)
+                } else {
+                    Frame::Null
+                }
+            }
             Command::Incr(key) => {
                 // Check if this is a quota key first
                 if self.db.is_quota(&key) {
@@ -174,8 +180,20 @@ impl Handler {
                 Frame::integer(value)
             }
             Command::Set(key, value) => {
-                self.db.set(key, value);
-                // TODO: SET doesn't emit a delta in current implementation
+                // Get shard_id and timestamp before set
+                let shard_id = (key.shard_hash() as u16) % 64; // Use same shard count as db
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                self.db.set_string(key.clone(), value.clone());
+
+                // Replicate to other nodes if replication is enabled
+                if let Some(ref handle) = self.replication {
+                    handle.send_string(shard_id, key, value, timestamp);
+                }
+
                 Frame::ok()
             }
             Command::QuotaSet(key, limit, window_secs) => {

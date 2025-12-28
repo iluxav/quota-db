@@ -28,8 +28,8 @@ pub enum Command {
     /// DECRBY key delta
     DecrBy(Key, i64),
 
-    /// SET key value (for compatibility - sets counter to value)
-    Set(Key, i64),
+    /// SET key value - store a string value
+    Set(Key, Bytes),
 
     /// QUOTASET key limit window_secs - set up a rate limit
     QuotaSet(Key, u64, u64),
@@ -129,7 +129,7 @@ impl Command {
             b"SET" => {
                 Self::ensure_args(&array, 3, "SET")?;
                 let key = Self::extract_key(&array, 1)?;
-                let value = Self::extract_i64(&array, 2)?;
+                let value = Self::extract_bytes(&array, 2)?;
                 Ok(Command::Set(key, value))
             }
             b"QUOTASET" => {
@@ -435,12 +435,12 @@ mod tests {
 
     #[test]
     fn test_parse_set() {
-        let frame = Frame::Array(vec![bulk("SET"), bulk("counter"), bulk("100")]);
+        let frame = Frame::Array(vec![bulk("SET"), bulk("mykey"), bulk("hello world")]);
         let cmd = Command::from_frame(frame).unwrap();
         match cmd {
             Command::Set(key, value) => {
-                assert_eq!(key.as_bytes(), b"counter");
-                assert_eq!(value, 100);
+                assert_eq!(key.as_bytes(), b"mykey");
+                assert_eq!(&value[..], b"hello world");
             }
             _ => panic!("expected Set"),
         }
@@ -489,6 +489,6 @@ mod tests {
         assert_eq!(Command::IncrBy(Key::from("k"), 1).name(), "INCRBY");
         assert_eq!(Command::Decr(Key::from("k")).name(), "DECR");
         assert_eq!(Command::DecrBy(Key::from("k"), 1).name(), "DECRBY");
-        assert_eq!(Command::Set(Key::from("k"), 1).name(), "SET");
+        assert_eq!(Command::Set(Key::from("k"), Bytes::from("v")).name(), "SET");
     }
 }

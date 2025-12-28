@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use parking_lot::RwLock;
 
 use crate::config::Config;
@@ -260,7 +261,7 @@ impl ShardedDb {
         self.shards[idx].read().get(key)
     }
 
-    /// Set a key to a specific value.
+    /// Set a counter key to a specific value.
     pub fn set(&self, key: Key, value: i64) {
         let idx = self.shard_index(&key);
         let shard_id = idx as u16;
@@ -270,6 +271,37 @@ impl ShardedDb {
         if let Some(ref handle) = self.persistence {
             handle.log_set(shard_id, seq, &key, value);
         }
+    }
+
+    /// Set a string value for a key (for caching JSON, HTML, JS, etc.).
+    pub fn set_string(&self, key: Key, value: Bytes) {
+        let idx = self.shard_index(&key);
+        let shard_id = idx as u16;
+        let (seq, timestamp) = self.shards[idx].write().set_string(key.clone(), value.clone());
+
+        // Log to WAL if persistence is enabled
+        if let Some(ref handle) = self.persistence {
+            handle.log_set_string(shard_id, seq, &key, &value, timestamp);
+        }
+    }
+
+    /// Get a string value for a key.
+    pub fn get_string(&self, key: &Key) -> Option<Bytes> {
+        let idx = self.shard_index(key);
+        self.shards[idx].read().get_string(key).cloned()
+    }
+
+    /// Set a string value with a specific timestamp (for replication with LWW semantics).
+    pub fn set_string_with_timestamp(&self, key: Key, value: Bytes, timestamp: u64) {
+        let idx = self.shard_index(&key);
+        self.shards[idx].write().set_string_with_timestamp(key, value, timestamp);
+        // Note: No WAL logging here - this is a replicated write
+    }
+
+    /// Get entry type for a key ("counter", "quota", or "string").
+    pub fn get_entry_type(&self, key: &Key) -> Option<&'static str> {
+        let idx = self.shard_index(key);
+        self.shards[idx].read().get_entry_type(key)
     }
 
     // ========== Quota Operations ==========

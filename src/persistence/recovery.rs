@@ -104,6 +104,7 @@ fn replay_wal(path: &Path, shard: &mut Shard, after_seq: u64) -> io::Result<usiz
 /// - Delete: Uses shard.delete
 /// - QuotaSet: Uses shard.quota_set
 /// - QuotaGrant: Uses shard.quota_add_tokens
+/// - SetString: Uses shard.set_string_with_timestamp
 fn apply_wal_entry(shard: &mut Shard, entry: &WalEntry) {
     match &entry.op {
         WalOp::Incr { key, node_id, delta } => {
@@ -134,6 +135,10 @@ fn apply_wal_entry(shard: &mut Shard, entry: &WalEntry) {
         WalOp::QuotaGrant { key, tokens, .. } => {
             // Add tokens to quota
             shard.quota_add_tokens(key, *tokens);
+        }
+        WalOp::SetString { key, value, timestamp } => {
+            // Restore string with original timestamp for LWW semantics
+            shard.set_string_with_timestamp(key.clone(), bytes::Bytes::from(value.clone()), *timestamp);
         }
     }
 }

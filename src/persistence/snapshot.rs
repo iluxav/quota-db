@@ -35,6 +35,9 @@ pub struct ShardSnapshot {
     pub quotas: Vec<QuotaSnapshot>,
     /// Allocator states
     pub allocators: Vec<AllocatorSnapshot>,
+    /// All string entries
+    #[serde(default)]
+    pub strings: Vec<StringSnapshot>,
 }
 
 impl ShardSnapshot {
@@ -54,6 +57,7 @@ impl ShardSnapshot {
             counters: Vec::new(),
             quotas: Vec::new(),
             allocators: Vec::new(),
+            strings: Vec::new(),
         }
     }
 
@@ -93,6 +97,18 @@ pub struct AllocatorSnapshot {
     pub grants: Vec<(u32, u64)>,
     pub total_granted: u64,
     pub window_start: u64,
+}
+
+/// Snapshot of a String entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StringSnapshot {
+    pub key: Key,
+    /// The stored value
+    pub value: Vec<u8>,
+    /// Timestamp for LWW conflict resolution
+    pub timestamp: u64,
+    /// Optional TTL timestamp
+    pub expires_at: Option<u64>,
 }
 
 /// Write a snapshot atomically (write to .tmp, then rename).

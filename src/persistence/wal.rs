@@ -85,6 +85,12 @@ pub enum WalOp {
         node_id: u32,
         tokens: u64,
     },
+    /// Set string value
+    SetString {
+        key: Key,
+        value: Vec<u8>,
+        timestamp: u64,
+    },
 }
 
 /// Maximum retries for transient sync failures

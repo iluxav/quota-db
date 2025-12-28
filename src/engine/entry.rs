@@ -1,16 +1,89 @@
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use crate::engine::quota::QuotaEntry;
 use crate::persistence::CounterSnapshot;
 use crate::types::{Key, NodeId};
 
-/// Entry type in the database - either a PN-Counter or a Quota.
+/// Entry type in the database - Counter, Quota, or String.
 #[derive(Debug, Clone)]
 pub enum Entry {
     /// PN-Counter CRDT for eventual consistency counting
     Counter(PnCounterEntry),
     /// Quota/rate-limit entry with token bucket semantics
     Quota(QuotaEntry),
+    /// String value for caching (JSON, HTML, JS, etc.)
+    String(StringEntry),
+}
+
+/// String entry for caching arbitrary byte data.
+/// Uses Last-Write-Wins (LWW) semantics for conflict resolution.
+#[derive(Debug, Clone)]
+pub struct StringEntry {
+    /// The stored value
+    value: Bytes,
+    /// Timestamp of last write (milliseconds since epoch)
+    timestamp: u64,
+    /// Optional TTL: Unix timestamp in milliseconds when this entry expires
+    expires_at: Option<u64>,
+}
+
+impl StringEntry {
+    /// Create a new string entry with current timestamp.
+    pub fn new(value: Bytes, timestamp: u64) -> Self {
+        Self {
+            value,
+            timestamp,
+            expires_at: None,
+        }
+    }
+
+    /// Get the stored value.
+    #[inline]
+    pub fn value(&self) -> &Bytes {
+        &self.value
+    }
+
+    /// Get the timestamp.
+    #[inline]
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Set the value with a new timestamp.
+    pub fn set(&mut self, value: Bytes, timestamp: u64) {
+        // LWW: only update if timestamp is newer
+        if timestamp >= self.timestamp {
+            self.value = value;
+            self.timestamp = timestamp;
+        }
+    }
+
+    /// Merge with another string entry (LWW: keep the one with higher timestamp).
+    pub fn merge(&mut self, other: &StringEntry) {
+        if other.timestamp > self.timestamp {
+            self.value = other.value.clone();
+            self.timestamp = other.timestamp;
+        }
+    }
+
+    /// Set expiration time.
+    #[inline]
+    pub fn set_expires_at(&mut self, ts: u64) {
+        self.expires_at = Some(ts);
+    }
+
+    /// Get expiration time.
+    #[inline]
+    pub fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
+
+    /// Check if entry is expired.
+    #[inline]
+    pub fn is_expired(&self, current_ts: u64) -> bool {
+        self.expires_at.map_or(false, |exp| current_ts >= exp)
+    }
 }
 
 impl Entry {
@@ -24,6 +97,12 @@ impl Entry {
     #[inline]
     pub fn is_counter(&self) -> bool {
         matches!(self, Entry::Counter(_))
+    }
+
+    /// Check if this is a string entry.
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        matches!(self, Entry::String(_))
     }
 
     /// Get as counter reference, if it is one.
@@ -61,6 +140,24 @@ impl Entry {
             _ => None,
         }
     }
+
+    /// Get as string reference, if it is one.
+    #[inline]
+    pub fn as_string(&self) -> Option<&StringEntry> {
+        match self {
+            Entry::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get as string mutable reference, if it is one.
+    #[inline]
+    pub fn as_string_mut(&mut self) -> Option<&mut StringEntry> {
+        match self {
+            Entry::String(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl From<PnCounterEntry> for Entry {
@@ -72,6 +169,12 @@ impl From<PnCounterEntry> for Entry {
 impl From<QuotaEntry> for Entry {
     fn from(quota: QuotaEntry) -> Self {
         Entry::Quota(quota)
+    }
+}
+
+impl From<StringEntry> for Entry {
+    fn from(string: StringEntry) -> Self {
+        Entry::String(string)
     }
 }
 

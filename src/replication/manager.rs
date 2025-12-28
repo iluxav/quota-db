@@ -18,6 +18,15 @@ pub struct DeltaNotification {
     pub delta: Delta,
 }
 
+/// String notification for replication (LWW semantics)
+#[derive(Debug, Clone)]
+pub struct StringNotification {
+    pub shard_id: u16,
+    pub key: crate::types::Key,
+    pub value: bytes::Bytes,
+    pub timestamp: u64,
+}
+
 /// Replication manager configuration
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
@@ -59,6 +68,7 @@ pub const DEFAULT_DELTA_CHANNEL_CAPACITY: usize = 10000;
 #[derive(Clone)]
 pub struct ReplicationHandle {
     tx: mpsc::Sender<DeltaNotification>,
+    string_tx: mpsc::Sender<StringNotification>,
     cluster_state: Arc<ClusterState>,
 }
 
@@ -70,6 +80,20 @@ impl ReplicationHandle {
         if let Err(_) = self.tx.try_send(DeltaNotification { shard_id, delta }) {
             // Channel full - replication is lagging behind
             // This is tracked in metrics; anti-entropy will repair gaps
+            METRICS.inc(&METRICS.replication_dropped);
+        }
+    }
+
+    /// Send a string value to be replicated (LWW semantics).
+    /// Uses try_send to avoid blocking the hot path.
+    pub fn send_string(&self, shard_id: u16, key: crate::types::Key, value: bytes::Bytes, timestamp: u64) {
+        if let Err(_) = self.string_tx.try_send(StringNotification {
+            shard_id,
+            key,
+            value,
+            timestamp,
+        }) {
+            // Channel full - string replication is lagging behind
             METRICS.inc(&METRICS.replication_dropped);
         }
     }
@@ -90,6 +114,8 @@ pub struct ReplicationManager {
     config: ReplicationConfig,
     /// Channel to receive deltas from shards (bounded for backpressure)
     delta_rx: mpsc::Receiver<DeltaNotification>,
+    /// Channel to receive string updates (bounded for backpressure)
+    string_rx: mpsc::Receiver<StringNotification>,
     /// Outbound peer states (we connect to these)
     outbound_peers: HashMap<SocketAddr, PeerState>,
     /// Active writers for sending to peers
@@ -110,6 +136,7 @@ impl ReplicationManager {
     /// Create a new replication manager
     pub fn new(config: ReplicationConfig) -> (Self, ReplicationHandle) {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let (string_tx, string_rx) = mpsc::channel(config.channel_capacity);
 
         let cluster_state = ClusterState::new(
             config.node_id,
@@ -126,6 +153,7 @@ impl ReplicationManager {
         let manager = Self {
             config,
             delta_rx: rx,
+            string_rx,
             outbound_peers,
             writers: HashMap::new(),
             db: None,
@@ -135,7 +163,7 @@ impl ReplicationManager {
             cluster_state: cluster_state.clone(),
         };
 
-        let handle = ReplicationHandle { tx, cluster_state };
+        let handle = ReplicationHandle { tx, string_tx, cluster_state };
         (manager, handle)
     }
 
@@ -232,6 +260,11 @@ impl ReplicationManager {
                 // Receive deltas from shards
                 Some(notif) = self.delta_rx.recv() => {
                     self.handle_delta(notif);
+                }
+
+                // Receive string updates to replicate
+                Some(notif) = self.string_rx.recv() => {
+                    self.handle_string_notification(notif).await;
                 }
 
                 // New outbound connection established
@@ -416,6 +449,26 @@ impl ReplicationManager {
     fn handle_delta(&mut self, notif: DeltaNotification) {
         for peer in self.outbound_peers.values_mut() {
             peer.queue_delta(notif.delta.clone());
+        }
+    }
+
+    /// Handle a string notification - broadcast to all peers
+    async fn handle_string_notification(&mut self, notif: StringNotification) {
+        debug!(
+            "Replicating string key {:?} to {} peers",
+            String::from_utf8_lossy(notif.key.as_bytes()),
+            self.writers.len()
+        );
+
+        let msg = Message::string_set(notif.shard_id, notif.key, notif.value, notif.timestamp);
+
+        // Send to all connected peers
+        for (addr, writer) in &mut self.writers {
+            if let Err(e) = writer.send(&msg).await {
+                warn!("Failed to send StringSet to {}: {}", addr, e);
+            } else {
+                debug!("Sent StringSet to {}", addr);
+            }
         }
     }
 
@@ -608,6 +661,19 @@ impl ReplicationManager {
             Message::Snapshot { shard_id, head_seq, digest, entries } => {
                 if let Some(ref mut ae) = self.anti_entropy {
                     ae.handle_snapshot(addr, shard_id, head_seq, digest, entries);
+                }
+                vec![]
+            }
+            Message::StringSet { shard_id: _, key, value, timestamp } => {
+                // Handle string replication from another node (LWW semantics)
+                debug!(
+                    "Received StringSet from {} for key {:?}, timestamp {}",
+                    addr, String::from_utf8_lossy(key.as_bytes()), timestamp
+                );
+
+                if let Some(ref db) = self.db {
+                    // Use set_string_with_timestamp to apply LWW semantics
+                    db.set_string_with_timestamp(key, value, timestamp);
                 }
                 vec![]
             }
@@ -816,7 +882,8 @@ impl ReplicationManager {
                         | Message::DeltaRequest { .. }
                         | Message::DigestExchange { .. }
                         | Message::SnapshotRequest { .. }
-                        | Message::Snapshot { .. } => {
+                        | Message::Snapshot { .. }
+                        | Message::StringSet { .. } => {
                             // Forward to manager for processing
                             if msg_tx.send((addr, msg)).await.is_err() {
                                 break;

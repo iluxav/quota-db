@@ -1,11 +1,13 @@
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::entry::Entry;
+use crate::engine::entry::{Entry, StringEntry};
 use crate::engine::quota::{AllocatorState, QuotaEntry};
 use crate::engine::PnCounterEntry;
-use crate::persistence::ShardSnapshot;
+use crate::persistence::{ShardSnapshot, StringSnapshot};
 use crate::replication::{Delta, ReplicationLog, ShardDigest};
 use crate::types::{Key, NodeId};
 
@@ -127,6 +129,11 @@ impl Shard {
                 let rep_delta = self.rep_log.append_increment(key, self.node_id, 0);
                 (-1, rep_delta)
             }
+            Entry::String(_) => {
+                // INCR on string key - not supported
+                let rep_delta = self.rep_log.append_increment(key, self.node_id, 0);
+                (-1, rep_delta)
+            }
         }
     }
 
@@ -159,28 +166,87 @@ impl Shard {
                 let rep_delta = self.rep_log.append_decrement(key, self.node_id, 0);
                 (-1, rep_delta)
             }
+            Entry::String(_) => {
+                // DECR on string key - not supported
+                let rep_delta = self.rep_log.append_decrement(key, self.node_id, 0);
+                (-1, rep_delta)
+            }
         }
     }
 
-    /// Get the current value of a key.
+    /// Get the current value of a key (for counters/quotas).
     /// For counters, returns the counter value.
     /// For quotas, returns remaining tokens.
+    /// For strings, returns None (use get_string instead).
     #[inline]
     pub fn get(&self, key: &Key) -> Option<i64> {
-        self.data.get(key).map(|e| match e {
-            Entry::Counter(c) => c.value(),
-            Entry::Quota(q) => q.local_tokens(),
+        self.data.get(key).and_then(|e| match e {
+            Entry::Counter(c) => Some(c.value()),
+            Entry::Quota(q) => Some(q.local_tokens()),
+            Entry::String(_) => None,
         })
     }
 
-    /// Set a key to a specific value. Returns the sequence number of this operation.
+    /// Get the string value of a key.
+    #[inline]
+    pub fn get_string(&self, key: &Key) -> Option<&Bytes> {
+        self.data.get(key).and_then(|e| match e {
+            Entry::String(s) => Some(s.value()),
+            _ => None,
+        })
+    }
+
+    /// Get entry type for a key.
+    #[inline]
+    pub fn get_entry_type(&self, key: &Key) -> Option<&'static str> {
+        self.data.get(key).map(|e| match e {
+            Entry::Counter(_) => "counter",
+            Entry::Quota(_) => "quota",
+            Entry::String(_) => "string",
+        })
+    }
+
+    /// Set a string value for a key. Returns the sequence number and timestamp.
+    pub fn set_string(&mut self, key: Key, value: Bytes) -> (u64, u64) {
+        let seq = self.rep_log.next_seq();
+        let timestamp = current_timestamp_millis();
+
+        match self.data.get_mut(&key) {
+            Some(Entry::String(s)) => {
+                s.set(value, timestamp);
+            }
+            _ => {
+                // Replace whatever was there (or create new)
+                let entry = StringEntry::new(value, timestamp);
+                self.data.insert(key, Entry::String(entry));
+            }
+        }
+
+        (seq, timestamp)
+    }
+
+    /// Set a string value with a specific timestamp (for WAL recovery/replication).
+    pub fn set_string_with_timestamp(&mut self, key: Key, value: Bytes, timestamp: u64) {
+        match self.data.get_mut(&key) {
+            Some(Entry::String(s)) => {
+                s.set(value, timestamp);
+            }
+            _ => {
+                // Replace whatever was there (or create new)
+                let entry = StringEntry::new(value, timestamp);
+                self.data.insert(key, Entry::String(entry));
+            }
+        }
+    }
+
+    /// Set a key to a specific counter value. Returns the sequence number of this operation.
     pub fn set(&mut self, key: Key, value: i64) -> u64 {
         let seq = self.rep_log.next_seq();
 
         // Get old value before modifying
         let old_value = self.data.get(&key).and_then(|e| match e {
             Entry::Counter(c) => Some(c.value()),
-            Entry::Quota(_) => None,
+            Entry::Quota(_) | Entry::String(_) => None,
         });
 
         let entry = self
@@ -241,7 +307,7 @@ impl Shard {
     pub fn quota_get(&self, key: &Key) -> Option<(u64, u64, i64)> {
         match self.data.get(key)? {
             Entry::Quota(q) => Some((q.limit(), q.window_secs(), q.local_tokens())),
-            Entry::Counter(_) => None,
+            Entry::Counter(_) | Entry::String(_) => None,
         }
     }
 
@@ -276,7 +342,7 @@ impl Shard {
                     None => QuotaResult::NeedTokens,
                 }
             }
-            Some(Entry::Counter(_)) => QuotaResult::NotQuota,
+            Some(Entry::Counter(_)) | Some(Entry::String(_)) => QuotaResult::NotQuota,
             None => QuotaResult::NotQuota,
         }
     }
@@ -403,8 +469,8 @@ impl Shard {
             None => {
                 self.data.insert(key, Entry::Counter(other.clone()));
             }
-            Some(Entry::Quota(_)) => {
-                // Can't merge counter into quota - ignore
+            Some(Entry::Quota(_)) | Some(Entry::String(_)) => {
+                // Can't merge counter into quota or string - ignore
             }
         }
     }
@@ -414,7 +480,7 @@ impl Shard {
         // Get old value before applying
         let old_value = self.data.get(&delta.key).and_then(|e| match e {
             Entry::Counter(c) => Some(c.value()),
-            Entry::Quota(_) => None,
+            Entry::Quota(_) | Entry::String(_) => None,
         });
 
         let entry = self
@@ -470,24 +536,24 @@ impl Shard {
 
     /// Create a snapshot of the shard's counter state.
     /// Returns (head_seq, digest, entries) where entries is a list of (key, value) pairs.
-    /// Quota entries are excluded from snapshots.
+    /// Quota and string entries are excluded from snapshots.
     pub fn create_snapshot(&self) -> (u64, u64, Vec<(Key, i64)>) {
         let entries: Vec<(Key, i64)> = self
             .data
             .iter()
             .filter_map(|(k, v)| match v {
                 Entry::Counter(c) => Some((k.clone(), c.value())),
-                Entry::Quota(_) => None,
+                Entry::Quota(_) | Entry::String(_) => None,
             })
             .collect();
         (self.rep_log.head_seq(), self.digest.value(), entries)
     }
 
     /// Apply a snapshot received from another replica.
-    /// Clears counter entries (keeps quotas) and rebuilds state from the snapshot.
+    /// Clears counter entries (keeps quotas and strings) and rebuilds state from the snapshot.
     pub fn apply_snapshot(&mut self, head_seq: u64, entries: Vec<(Key, i64)>) {
-        // Clear counter entries (keep quotas)
-        self.data.retain(|_, v| v.is_quota());
+        // Clear counter entries (keep quotas and strings)
+        self.data.retain(|_, v| v.is_quota() || v.is_string());
         self.digest.reset();
 
         for (key, value) in entries {
@@ -521,6 +587,14 @@ impl Shard {
                 }
                 Entry::Quota(quota) => {
                     snapshot.quotas.push(quota.to_snapshot(key.clone()));
+                }
+                Entry::String(string) => {
+                    snapshot.strings.push(StringSnapshot {
+                        key: key.clone(),
+                        value: string.value().to_vec(),
+                        timestamp: string.timestamp(),
+                        expires_at: string.expires_at(),
+                    });
                 }
             }
         }
@@ -564,6 +638,18 @@ impl Shard {
             self.allocators.insert(alloc_snap.key, state);
         }
 
+        // Restore strings
+        for string_snap in snapshot.strings {
+            let mut entry = StringEntry::new(
+                Bytes::from(string_snap.value),
+                string_snap.timestamp,
+            );
+            if let Some(exp) = string_snap.expires_at {
+                entry.set_expires_at(exp);
+            }
+            self.data.insert(string_snap.key, Entry::String(entry));
+        }
+
         // Reset replication log to snapshot sequence
         self.rep_log.reset_to(snapshot.seq);
     }
@@ -574,8 +660,11 @@ impl Shard {
             let value = match &entry {
                 Entry::Counter(c) => c.value(),
                 Entry::Quota(q) => q.local_tokens(),
+                Entry::String(_) => 0, // Strings don't contribute to digest
             };
-            self.digest.remove(key, value);
+            if value != 0 {
+                self.digest.remove(key, value);
+            }
         }
     }
 
@@ -588,6 +677,14 @@ impl Shard {
     pub fn keys(&self) -> impl Iterator<Item = &Key> {
         self.data.keys()
     }
+}
+
+/// Get current timestamp in milliseconds.
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

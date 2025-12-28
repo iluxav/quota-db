@@ -30,6 +30,8 @@ pub enum MessageType {
     SnapshotRequest = 11,
     /// Anti-entropy: Full snapshot of a shard
     Snapshot = 12,
+    /// Replicate a string value (LWW semantics)
+    StringSet = 13,
 }
 
 impl MessageType {
@@ -47,6 +49,7 @@ impl MessageType {
             10 => Some(Self::DigestExchange),
             11 => Some(Self::SnapshotRequest),
             12 => Some(Self::Snapshot),
+            13 => Some(Self::StringSet),
             _ => None,
         }
     }
@@ -119,6 +122,13 @@ pub enum Message {
         head_seq: u64,
         digest: u64,
         entries: Vec<(Key, i64)>,
+    },
+    /// Replicate a string value (LWW semantics)
+    StringSet {
+        shard_id: u16,
+        key: Key,
+        value: Bytes,
+        timestamp: u64,
     },
 }
 
@@ -242,6 +252,21 @@ impl Message {
                     buf.put_slice(key_bytes);
                     buf.put_i64_le(*value);
                 }
+            }
+            Message::StringSet {
+                shard_id,
+                key,
+                value,
+                timestamp,
+            } => {
+                buf.put_u8(MessageType::StringSet as u8);
+                buf.put_u16_le(*shard_id);
+                let key_bytes = key.as_bytes();
+                buf.put_u16_le(key_bytes.len() as u16);
+                buf.put_slice(key_bytes);
+                buf.put_u32_le(value.len() as u32);
+                buf.put_slice(value);
+                buf.put_u64_le(*timestamp);
             }
         }
 
@@ -444,6 +469,30 @@ impl Message {
                     entries,
                 })
             }
+            MessageType::StringSet => {
+                // shard_id(2) + key_len(2) + key(...) + value_len(4) + value(...) + timestamp(8)
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                let shard_id = buf.get_u16_le();
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len + 4 {
+                    return None;
+                }
+                let key = Key::new(buf.copy_to_bytes(key_len));
+                let value_len = buf.get_u32_le() as usize;
+                if buf.remaining() < value_len + 8 {
+                    return None;
+                }
+                let value = buf.copy_to_bytes(value_len);
+                let timestamp = buf.get_u64_le();
+                Some(Message::StringSet {
+                    shard_id,
+                    key,
+                    value,
+                    timestamp,
+                })
+            }
         }
     }
 
@@ -530,6 +579,16 @@ impl Message {
             head_seq,
             digest,
             entries,
+        }
+    }
+
+    /// Create a StringSet message for replicating string values
+    pub fn string_set(shard_id: u16, key: Key, value: Bytes, timestamp: u64) -> Self {
+        Message::StringSet {
+            shard_id,
+            key,
+            value,
+            timestamp,
         }
     }
 
@@ -934,6 +993,33 @@ mod tests {
                 assert!(entries.is_empty());
             }
             _ => panic!("Expected Snapshot message"),
+        }
+    }
+
+    #[test]
+    fn test_string_set_encode_decode() {
+        let value = Bytes::from(r#"{"name":"Alice","email":"alice@example.com"}"#);
+        let msg = Message::string_set(7, Key::from("user:123"), value.clone(), 1234567890123);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Message::decode(&mut bytes).unwrap();
+
+        match decoded {
+            Message::StringSet {
+                shard_id,
+                key,
+                value: decoded_value,
+                timestamp,
+            } => {
+                assert_eq!(shard_id, 7);
+                assert_eq!(key.as_bytes(), b"user:123");
+                assert_eq!(decoded_value, value);
+                assert_eq!(timestamp, 1234567890123);
+            }
+            _ => panic!("Expected StringSet message"),
         }
     }
 }

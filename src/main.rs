@@ -135,7 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 channel_capacity: config.replication_channel_size,
             };
 
-            let (manager, handle) = ReplicationManager::new(rep_config);
+            let (mut manager, handle) = ReplicationManager::new(rep_config);
+
+            // Set db reference for string replication and other operations
+            manager.set_db(db.clone());
 
             // Create apply_delta callback
             let db_clone = db.clone();

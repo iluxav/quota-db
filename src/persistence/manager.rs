@@ -106,6 +106,20 @@ impl PersistenceHandle {
         self.send(shard_id, entry);
     }
 
+    /// Log a string set operation.
+    pub fn log_set_string(&self, shard_id: u16, seq: u64, key: &Key, value: &[u8], timestamp: u64) {
+        let entry = WalEntry {
+            seq,
+            timestamp: current_timestamp_millis(),
+            op: WalOp::SetString {
+                key: key.clone(),
+                value: value.to_vec(),
+                timestamp,
+            },
+        };
+        self.send(shard_id, entry);
+    }
+
     fn send(&self, shard_id: u16, entry: WalEntry) {
         let msg = WalMessage { shard_id, entry };
         // Use try_send to avoid blocking - if channel is full, track and warn
